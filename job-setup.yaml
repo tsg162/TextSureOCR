@@ -1,0 +1,91 @@
+name: textsure-setup
+command:
+  - bash
+  - -c
+  - |
+    set -e
+    echo "=== TextSureOCR Setup ==="
+
+    # ── Kill any previous TextSureOCR service ──
+    echo "--- Cleaning up old service ---"
+    fuser -k 5002/tcp 2>/dev/null || true
+    sleep 1
+
+    # ── Check environment ──
+    echo "--- Environment ---"
+    python3 --version
+    nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader
+    df -h /workspace | tail -1
+    echo ""
+
+    # ── Install dependencies ──
+    echo "--- Installing dependencies ---"
+    pip install --quiet fastapi uvicorn transformers accelerate requests
+    # torch should already be on the Vast.ai image; install if missing
+    python3 -c "import torch; print(f'torch {torch.__version__} cuda={torch.cuda.is_available()}')" 2>/dev/null \
+      || pip install --quiet torch
+    echo "Dependencies installed."
+    echo ""
+
+    # ── Write app.py ──
+    echo "--- Writing app.py ---"
+    WORK=/workspace/textsure
+    mkdir -p $WORK
+
+    python3 -c "
+    import base64, sys
+    data = base64.b64decode(sys.stdin.read())
+    with open('$WORK/app.py', 'wb') as f:
+        f.write(data)
+    print(f'Wrote {len(data)} bytes to $WORK/app.py')
+    " <<'B64EOF'
+    PLACEHOLDER_BASE64_APP
+    B64EOF
+
+    # ── Write tests.py ──
+    echo "--- Writing tests.py ---"
+    python3 -c "
+    import base64, sys
+    data = base64.b64decode(sys.stdin.read())
+    with open('$WORK/tests.py', 'wb') as f:
+        f.write(data)
+    print(f'Wrote {len(data)} bytes to $WORK/tests.py')
+    " <<'B64EOF'
+    PLACEHOLDER_BASE64_TESTS
+    B64EOF
+
+    echo ""
+    echo "--- Starting TextSureOCR on port 5002 ---"
+    cd $WORK
+    TEXTSURE_PORT=5002 python3 app.py &
+    SERVICE_PID=$!
+    echo "Service PID: $SERVICE_PID"
+
+    # ── Wait for model to load + health ──
+    echo "Waiting for model load + health..."
+    for i in $(seq 1 60); do
+      sleep 5
+      if ! kill -0 $SERVICE_PID 2>/dev/null; then
+        echo "FATAL: service died"
+        exit 1
+      fi
+      HEALTH=$(curl -s http://localhost:5002/health 2>/dev/null || true)
+      if echo "$HEALTH" | grep -q '"model_loaded":true' 2>/dev/null; then
+        echo "Health OK: $HEALTH"
+        break
+      fi
+      echo "  attempt $i/60 ..."
+    done
+
+    # ── Run test battery ──
+    echo ""
+    echo "=== Running test battery (tests.py) ==="
+    echo ""
+    python3 $WORK/tests.py http://localhost:5002 || true
+    echo ""
+    echo "=== Test battery complete ==="
+
+    # Keep the service running
+    wait $SERVICE_PID
+resources:
+  gpu_count: 1
