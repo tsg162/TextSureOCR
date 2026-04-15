@@ -2,7 +2,7 @@
 # TextSureOCR — one-liner bootstrap for fresh Vast.ai instances.
 #
 # Usage:
-#   bash <(curl -sL https://raw.githubusercontent.com/timmanz/TextSureOCR/main/setup.sh) <tunnel-token> [auth-token]
+#   bash <(curl -sL https://raw.githubusercontent.com/tsg162/TextSureOCR/main/setup.sh) <tunnel-token> [auth-token]
 #
 # Or, if already cloned:
 #   bash setup.sh <tunnel-token> [auth-token]
@@ -11,7 +11,7 @@ set -euo pipefail
 TUNNEL_TOKEN="${1:-}"
 AUTH_TOKEN="${2:-}"
 WORK=/workspace/textsure
-REPO_URL="https://github.com/timmanz/TextSureOCR.git"
+REPO_URL="https://github.com/tsg162/TextSureOCR.git"
 
 if [ -z "$TUNNEL_TOKEN" ]; then
   echo "Usage: bash setup.sh <tunnel-token> [auth-token]"
