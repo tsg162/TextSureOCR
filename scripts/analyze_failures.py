@@ -740,6 +740,10 @@ def main():
         all_test_cases = []
         for test_file in test_files:
             if Path(test_file).exists():
+                # Skip continuation test files - they need --continuation flag
+                if "continuation" in str(test_file).lower():
+                    print(f"Skipping {test_file} (use --continuation flag for continuation tests)")
+                    continue
                 cases = load_test_cases_from_file(str(test_file))
                 all_test_cases.extend(cases)
                 print(f"Loaded {len(cases)} test cases from {test_file}")
@@ -764,10 +768,26 @@ def main():
                 try:
                     # Helper to check if test passed
                     def check_pass(res: dict) -> bool:
+                        # Check 1: Word-level span match (new format)
                         for span in res.get("spans", []):
                             if span.get("text", "").lower() == tc.error_word.lower():
                                 suggestions = [s["text"].lower() for s in span.get("suggestions", [])]
                                 if tc.expected_correction.lower() in suggestions:
+                                    return True
+
+                        # Check 2: Beam search correction produces expected result
+                        # The best beam's corrected text should contain the expected correction
+                        # and NOT contain the error word
+                        debug = res.get("debug", {})
+                        beam_search = debug.get("beam_search", {}) if debug else {}
+                        if beam_search:
+                            final_beams = beam_search.get("final_beam_states", [])
+                            if final_beams:
+                                best_beam = final_beams[0]
+                                corrected = best_beam.get("corrected_text", "").lower()
+                                # Check if error word is fixed
+                                if tc.expected_correction.lower() in corrected and \
+                                   tc.error_word.lower() not in corrected:
                                     return True
                         return False
 

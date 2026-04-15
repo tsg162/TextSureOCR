@@ -606,17 +606,52 @@ def _beam_search_ocr(
         # Only report corrections if they improve over original
         if best_lp > orig_log_prob and best_corrections:
             spans = []
+
+            # Group corrections by word and create word-level spans
+            # First, find all unique words that contain corrections
+            word_corrections: dict[tuple[int, int], list[tuple[int, int, str, str]]] = {}
+
             for start, end, original, replacement in best_corrections:
-                # Calculate improvement for this specific correction
+                # Find word boundaries around this correction
+                word_start = start
+                word_end = end
+
+                # Expand left to word boundary
+                while word_start > 0 and text[word_start - 1].isalnum():
+                    word_start -= 1
+
+                # Expand right to word boundary
+                while word_end < len(text) and text[word_end].isalnum():
+                    word_end += 1
+
+                word_key = (word_start, word_end)
+                if word_key not in word_corrections:
+                    word_corrections[word_key] = []
+                word_corrections[word_key].append((start, end, original, replacement))
+
+            # For each word with corrections, create a single span
+            for (word_start, word_end), corrections_in_word in word_corrections.items():
+                original_word = text[word_start:word_end]
+
+                # Apply all corrections to get the corrected word
+                corrected_word = original_word
+                # Sort by position descending to preserve offsets
+                sorted_corr = sorted(corrections_in_word, key=lambda c: c[0], reverse=True)
+                for corr_start, corr_end, _, repl in sorted_corr:
+                    # Convert to word-relative offsets
+                    rel_start = corr_start - word_start
+                    rel_end = corr_end - word_start
+                    corrected_word = corrected_word[:rel_start] + repl + corrected_word[rel_end:]
+
                 improvement = best_lp - orig_log_prob
 
                 spans.append(Span(
-                    start=start,
-                    end=end,
-                    text=original,
+                    start=word_start,
+                    end=word_end,
+                    text=original_word,
                     kind="ocr_error",
                     suggestions=[Suggestion(
-                        text=replacement,
+                        text=corrected_word,
                         score=round(improvement, 2),
                     )],
                 ))
