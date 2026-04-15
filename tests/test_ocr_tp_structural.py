@@ -13,7 +13,8 @@ slot for any word) to score whether a candidate correction fits.
 """
 
 import pytest
-from helpers import ocr_check, print_beam_debug, DEBUG_MODE
+import helpers
+from helpers import ocr_check, print_beam_debug
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -341,8 +342,8 @@ def test_ocr_char_confusion(text, error_word, expected_correction, test_id, api)
             return  # PASS
 
     # FAIL - print debug if available
-    if DEBUG_MODE:
-        print_beam_debug(body, test_id, error_word, expected_correction)
+    if helpers.DEBUG_MODE:
+        print_beam_debug(body, test_id, error_word, expected_correction, text)
 
     # Now assert to trigger proper pytest failure
     if body["result"] != "issue_detected":
@@ -812,7 +813,7 @@ def test_ocr_multi_error(text, min_spans, test_id, api):
         return  # PASS
 
     # FAIL
-    if DEBUG_MODE:
+    if helpers.DEBUG_MODE:
         print_beam_debug(body, test_id)
 
     if body["result"] != "issue_detected":
@@ -2365,8 +2366,8 @@ def test_ocr_hard_case(text, error_word, expected_correction, test_id, api):
             return  # PASS
 
     # FAIL - print debug if available
-    if DEBUG_MODE:
-        print_beam_debug(body, test_id, error_word, expected_correction)
+    if helpers.DEBUG_MODE:
+        print_beam_debug(body, test_id, error_word, expected_correction, text)
 
     # Now assert to trigger proper pytest failure
     if body["result"] != "issue_detected":

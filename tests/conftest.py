@@ -69,12 +69,39 @@ def pytest_addoption(parser):
         "--server", action="store", default=None,
         help="named server in ~/.textsureocr/servers.yaml (integration tests)",
     )
+    parser.addoption(
+        "--ocr-debug", action="store_true", default=False,
+        help="print verbose beam search debug on test failures",
+    )
+    parser.addoption(
+        "--debug-log", action="store", default=None,
+        help="also write debug output to this file (implies --debug)",
+    )
 
 
 @pytest.fixture(scope="session")
 def target(pytestconfig):
     source, url, token = _resolve_target(pytestconfig.getoption("--server"))
     return {"source": source, "url": url, "token": token}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def debug_config(pytestconfig):
+    """Debug configuration for verbose failure output."""
+    import helpers
+
+    debug_log = pytestconfig.getoption("--debug-log")
+    debug_enabled = pytestconfig.getoption("--ocr-debug") or debug_log is not None
+
+    helpers.DEBUG_MODE = debug_enabled
+    if debug_log:
+        helpers._debug_file = open(debug_log, "w")
+
+    yield
+
+    if helpers._debug_file:
+        helpers._debug_file.close()
+        helpers._debug_file = None
 
 
 @pytest.fixture(scope="session")

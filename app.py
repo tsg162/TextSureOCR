@@ -104,7 +104,8 @@ _D_FOR_CL_MORPHEMES = (
 POSITIONAL_CONFUSIONS: dict[str, list[str]] = {
     "d": ["c", "l"],
     "c": ["d"],
-    "l": ["d"],
+    "l": ["d", "i"],  # l can be misread as i in sans-serif fonts
+    "i": ["l"],       # i can be misread as l
 }
 
 log = logging.getLogger("textsure")
