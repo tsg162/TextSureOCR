@@ -186,10 +186,67 @@ class BranchExploreResult(BaseModel):
     corrections_tried: list[dict] = []                 # Each correction attempt
 
 
+# ── Beam Search Debug Models ───────────────────────────────────────────
+
+class PatternMatch(BaseModel):
+    """A single OCR pattern occurrence found in the text."""
+    pattern_key: str                              # e.g., "rn", "vv", "cl"
+    start: int                                    # char offset in original text
+    end: int
+    original_text: str                            # actual chars matched
+    replacements: list[str]                       # possible corrections ["m"], ["w"], etc.
+
+
+class BeamState(BaseModel):
+    """A single beam (correction hypothesis) in the search."""
+    beam_id: int
+    corrected_text: str                           # text with corrections applied
+    corrections: list[tuple[int, int, str, str]]  # [(start, end, original, replacement), ...]
+    log_prob: float | None = None                 # full-text log probability
+    is_original: bool = False                     # true if no corrections applied
+
+
+class BeamPruneEvent(BaseModel):
+    """Debug info for a pruning step."""
+    after_pattern_idx: int
+    pattern_key: str
+    beams_before: int
+    beams_after: int
+    surviving_beams: list[int]                    # beam_ids that survived
+    pruned_beams: list[int]                       # beam_ids that were pruned
+    scores: dict[int, float]                      # beam_id -> log_prob
+
+
+class BeamSearchDebug(BaseModel):
+    """Comprehensive debug info for beam search OCR correction."""
+    # Input analysis
+    original_text: str
+    original_log_prob: float = 0.0
+
+    # Pattern detection
+    patterns_found: list[PatternMatch] = []
+
+    # Beam evolution
+    initial_beams: int = 1
+    final_beams: int = 0
+    prune_events: list[BeamPruneEvent] = []
+
+    # All beams at end (sorted by score)
+    final_beam_states: list[BeamState] = []
+
+    # Decision
+    best_beam_id: int = 0
+    best_log_prob: float = 0.0
+    improvement_over_original: float = 0.0
+    corrections_applied: list[tuple[int, int, str, str]] = []
+
+
 class DebugInfo(BaseModel):
     all_tokens: list[TokenDebug] = []
     words_analyzed: list[WordDebug] = []
     branch_explore_results: list[BranchExploreResult] = []
+    beam_search: BeamSearchDebug | None = None
+
 
 class CheckResponse(BaseModel):
     result: str
@@ -352,6 +409,225 @@ def _token_log_probs(text: str) -> list[tuple[int, int, float]]:
 def _total_log_prob(text: str) -> float:
     """Sum of per-token log-probs for the full text (one forward pass)."""
     return sum(lp for _, _, lp in _token_log_probs(text))
+
+
+# ── Beam Search OCR Correction ─────────────────────────────────────────
+
+def _find_all_ocr_patterns(text: str) -> list[PatternMatch]:
+    """
+    Find all OCR confusion pattern occurrences in text.
+
+    Returns PatternMatch objects sorted by position, with overlaps removed
+    (longer patterns take precedence).
+    """
+    matches = []
+
+    # Check main confusions
+    for key, replacements in CONFUSIONS.items():
+        for m in re.finditer(re.escape(key), text, re.IGNORECASE):
+            matches.append(PatternMatch(
+                pattern_key=key,
+                start=m.start(),
+                end=m.end(),
+                original_text=m.group(),
+                replacements=replacements,
+            ))
+
+    # Check positional confusions
+    for key, replacements in POSITIONAL_CONFUSIONS.items():
+        for m in re.finditer(re.escape(key), text, re.IGNORECASE):
+            matches.append(PatternMatch(
+                pattern_key=key,
+                start=m.start(),
+                end=m.end(),
+                original_text=m.group(),
+                replacements=replacements,
+            ))
+
+    # Sort by (start, -length) so longer patterns come first at same position
+    matches.sort(key=lambda m: (m.start, -(m.end - m.start)))
+
+    # Remove overlapping patterns (keep longer/earlier ones)
+    filtered = []
+    last_end = -1
+    for m in matches:
+        if m.start >= last_end:
+            filtered.append(m)
+            last_end = m.end
+
+    return filtered
+
+
+def _apply_corrections(text: str, corrections: list[tuple[int, int, str]]) -> str:
+    """
+    Apply corrections to text. Each correction is (start, end, replacement).
+    Corrections are in original-text coordinates.
+    """
+    # Sort by start descending to preserve offsets
+    sorted_corr = sorted(corrections, key=lambda c: c[0], reverse=True)
+    result = text
+    for start, end, repl in sorted_corr:
+        result = result[:start] + repl + result[end:]
+    return result
+
+
+def _beam_search_ocr(
+    text: str,
+    beam_width: int = 20,
+    debug: bool = False,
+) -> tuple[list[Span], BeamSearchDebug | None]:
+    """
+    Beam search over OCR corrections.
+
+    Instead of word-based analysis, we:
+    1. Find all OCR pattern occurrences in the text
+    2. For each pattern, branch: keep original OR apply each replacement
+    3. Prune beams by full-text log-probability
+    4. Return corrections from the best beam
+
+    Returns (spans, debug_info).
+    """
+    debug_info = BeamSearchDebug(original_text=text) if debug else None
+
+    # Score original text
+    orig_log_prob = _total_log_prob(text)
+    if debug_info:
+        debug_info.original_log_prob = orig_log_prob
+
+    # Find all OCR patterns
+    patterns = _find_all_ocr_patterns(text)
+    if debug_info:
+        debug_info.patterns_found = patterns
+
+    log.info("Beam search: found %d OCR patterns in text", len(patterns))
+
+    if not patterns:
+        # No patterns to explore
+        if debug_info:
+            debug_info.final_beams = 1
+            debug_info.final_beam_states = [BeamState(
+                beam_id=0,
+                corrected_text=text,
+                corrections=[],
+                log_prob=orig_log_prob,
+                is_original=True,
+            )]
+            debug_info.best_beam_id = 0
+            debug_info.best_log_prob = orig_log_prob
+        return [], debug_info
+
+    # Each beam is: (corrections_list, beam_id)
+    # corrections_list = [(start, end, original, replacement), ...]
+    next_beam_id = 0
+    beams: list[tuple[list[tuple[int, int, str, str]], int]] = [([], next_beam_id)]
+    next_beam_id += 1
+
+    if debug_info:
+        debug_info.initial_beams = 1
+
+    # Process each pattern position
+    for pat_idx, pat in enumerate(patterns):
+        new_beams = []
+
+        for corrections, bid in beams:
+            # Option 1: Keep original (no new correction)
+            new_beams.append((corrections.copy(), bid))
+
+            # Option 2+: Apply each replacement
+            for repl in pat.replacements:
+                new_corr = corrections.copy()
+                new_corr.append((pat.start, pat.end, pat.original_text, repl))
+                new_beams.append((new_corr, next_beam_id))
+                next_beam_id += 1
+
+        # Prune if we have too many beams
+        if len(new_beams) > beam_width:
+            # Score all beams
+            scored = []
+            for corrections, bid in new_beams:
+                # Convert to format for _apply_corrections
+                corr_tuples = [(s, e, r) for s, e, _, r in corrections]
+                corrected = _apply_corrections(text, corr_tuples)
+                lp = _total_log_prob(corrected)
+                scored.append((corrections, bid, lp))
+
+            # Sort by log prob descending
+            scored.sort(key=lambda x: x[2], reverse=True)
+
+            if debug_info:
+                prune_event = BeamPruneEvent(
+                    after_pattern_idx=pat_idx,
+                    pattern_key=pat.pattern_key,
+                    beams_before=len(new_beams),
+                    beams_after=beam_width,
+                    surviving_beams=[bid for _, bid, _ in scored[:beam_width]],
+                    pruned_beams=[bid for _, bid, _ in scored[beam_width:]],
+                    scores={bid: lp for _, bid, lp in scored},
+                )
+                debug_info.prune_events.append(prune_event)
+
+            beams = [(c, bid) for c, bid, _ in scored[:beam_width]]
+        else:
+            beams = new_beams
+
+    # Final scoring of all beams
+    final_scored = []
+    for corrections, bid in beams:
+        corr_tuples = [(s, e, r) for s, e, _, r in corrections]
+        corrected = _apply_corrections(text, corr_tuples)
+        lp = _total_log_prob(corrected)
+        final_scored.append((corrections, bid, corrected, lp))
+
+    final_scored.sort(key=lambda x: x[3], reverse=True)
+
+    if debug_info:
+        debug_info.final_beams = len(final_scored)
+        debug_info.final_beam_states = [
+            BeamState(
+                beam_id=bid,
+                corrected_text=corrected,
+                corrections=corrections,
+                log_prob=lp,
+                is_original=(len(corrections) == 0),
+            )
+            for corrections, bid, corrected, lp in final_scored
+        ]
+
+    # Best beam
+    if final_scored:
+        best_corrections, best_bid, best_text, best_lp = final_scored[0]
+
+        if debug_info:
+            debug_info.best_beam_id = best_bid
+            debug_info.best_log_prob = best_lp
+            debug_info.improvement_over_original = best_lp - orig_log_prob
+            debug_info.corrections_applied = best_corrections
+
+        # Only report corrections if they improve over original
+        if best_lp > orig_log_prob and best_corrections:
+            spans = []
+            for start, end, original, replacement in best_corrections:
+                # Calculate improvement for this specific correction
+                improvement = best_lp - orig_log_prob
+
+                spans.append(Span(
+                    start=start,
+                    end=end,
+                    text=original,
+                    kind="ocr_error",
+                    suggestions=[Suggestion(
+                        text=replacement,
+                        score=round(improvement, 2),
+                    )],
+                ))
+
+            log.info(
+                "Beam search: best correction improves log-prob by %.2f (%d corrections)",
+                best_lp - orig_log_prob, len(best_corrections),
+            )
+            return spans, debug_info
+
+    return [], debug_info
 
 
 # ── Correction generation ─────────────────────────────────────────────
@@ -821,13 +1097,20 @@ def _has_ocr_pattern(word: str) -> bool:
 # ── /v1/ocr/check ─────────────────────────────────────────────────────
 
 def _ocr_check(text: str, debug: bool = False) -> CheckResponse:
-    debug_info = DebugInfo() if (debug or DEBUG_MODE) else None
-    preds = _token_predictions(text)
-    if not preds:
-        return CheckResponse(result="ok", score=0.95, spans=[], debug=debug_info)
+    """
+    OCR error detection via beam search over correction hypotheses.
 
-    # Collect token debug info
-    if debug_info is not None:
+    Strategy:
+    1. Find all OCR confusion patterns in the text (rn, vv, cl, d, etc.)
+    2. Beam search: for each pattern, branch into keep-original vs apply-correction
+    3. Score each beam by full-text log-probability
+    4. Report corrections from the best beam if it improves over original
+    """
+    debug_info = DebugInfo() if (debug or DEBUG_MODE) else None
+
+    # Collect token debug info for backwards compatibility
+    preds = _token_predictions(text)
+    if debug_info is not None and preds:
         for t in preds:
             top_preds = [
                 (lm.tokenizer.decode([tid]).strip(), prob, tid)
@@ -844,283 +1127,30 @@ def _ocr_check(text: str, debug: bool = False) -> CheckResponse:
                 is_suspicious=t["actual_prob"] < TOKEN_PROB_FLOOR,
             ))
 
-    # ── Phase 1: find words with suspicious tokens ──
-    # A word enters Phase 2 if ANY of:
-    #   (a) it contains a token with P(actual | prefix) < floor  (LM signal), OR
-    #   (b) it matches a structural OCR-confusion pattern         (heuristic signal), OR
-    #   (c) BRANCH_EXPLORE is enabled and word has an OCR pattern worth trying
-    word_candidates: list[tuple[str, int, int, list[dict], list[dict], bool]] = []
+    # ── Beam search over OCR corrections ──
+    spans, beam_debug = _beam_search_ocr(text, beam_width=20, debug=(debug or DEBUG_MODE))
 
-    for m in re.finditer(r"\S+", text):
-        raw, rs, re_ = m.group(), m.start(), m.end()
-        # Strip leading/trailing punctuation so the span covers just the
-        # word itself — not trailing commas, periods, quotes, parens, etc.
-        lstrip = len(raw) - len(raw.lstrip(_WORD_PUNCT))
-        rstrip = len(raw) - len(raw.rstrip(_WORD_PUNCT))
-        ws = rs + lstrip
-        we = re_ - rstrip
-        if we <= ws:
-            continue
-        word = text[ws:we]
-        if len(word) < MIN_WORD_LEN:
-            continue
-
-        # Pure digits/punctuation (e.g. "16", "750", "--", "$50") aren't
-        # OCR-checkable as words — the only OCR-error case for them
-        # (digit-in-alpha) is already covered by the structural pattern,
-        # which requires alpha context. Skipping suppresses false positives
-        # on legitimate numbers, currency, dates, and punctuation runs.
-        if _NO_ALPHA.match(word):
-            continue
-
-        # Tokens overlapping this word
-        word_tokens = [t for t in preds if t["char_start"] < we and t["char_end"] > ws]
-        if not word_tokens:
-            continue
-
-        # Suspicious tokens: very low actual probability
-        suspicious = [
-            t for t in word_tokens
-            if t["actual_prob"] < TOKEN_PROB_FLOOR
-        ]
-
-        # Long alphanumeric codes (tracking numbers, SKUs, IDs) look
-        # structurally suspicious by the digit-in-alpha rule, but their
-        # letter/digit intermixing is legitimate. Suppress both the
-        # structural flag and any LM-based flagging for them.
-        if _looks_like_code(word):
-            continue
-
-        structural = _is_structurally_suspicious(word)
-
-        # LM veto for structural-only flags: if every token in the word
-        # has high actual probability, the LM is confident the word fits
-        # the context. Don't waste a candidate-scoring pass on it.
-        # This lets us keep the regex rules generous without flooding
-        # clean prose with false positives.
-        if structural and not suspicious:
-            min_prob = min(t["actual_prob"] for t in word_tokens)
-            if min_prob > 0.5:
-                structural = False
-
-        # Branch-and-explore: also include words with OCR patterns even if
-        # they passed surprisal/structural checks. Let scoring decide.
-        branch_explore = False
-        if BRANCH_EXPLORE and not suspicious and not structural:
-            if _has_ocr_pattern(word):
-                branch_explore = True
-                log.info("  branch-explore: trying corrections on '%s'", word)
-
-        if not suspicious and not structural and not branch_explore:
-            continue
-
-        # Log what we found
-        for t in suspicious:
-            top_id, top_prob = t["top_preds"][0]
-            top_text = lm.tokenizer.decode([top_id]).strip()
-            log.info(
-                "  token [%s] P=%.4f — model prefers [%s] P=%.4f  (in word '%s')",
-                t["actual_text"], t["actual_prob"],
-                top_text, top_prob,
-                word,
-            )
-        if structural and not suspicious:
-            log.info("  structural match on '%s' (no LM signal)", word)
-        # Include branch_explore flag (treated as structural for filtering purposes)
-        is_structural = structural or branch_explore
-        structural_reasons = _get_structural_reasons(word) if structural else []
-        word_candidates.append((word, ws, we, word_tokens, suspicious, is_structural, branch_explore, structural_reasons))
-
-    log.info(
-        "OCR check: %d tokens, floor=%.3f, candidate words=%d (%s)",
-        len(preds), TOKEN_PROB_FLOOR,
-        len(word_candidates),
-        ", ".join(w for w, _, _, _, _, _, _, _ in word_candidates),
-    )
-
-    if not word_candidates:
-        min_prob = min(t["actual_prob"] for t in preds)
-        margin = min(min_prob / TOKEN_PROB_FLOOR, 1.0) if TOKEN_PROB_FLOOR > 0 else 1.0
-        conf = 0.80 + 0.19 * min(margin, 1.0)
-        return CheckResponse(result="ok", score=round(conf, 3), spans=[], debug=debug_info)
-
-    # ── Phase 2: build corrections, score, and filter ──
-    spans: list[Span] = []
-    for word, ws, we, word_tokens, suspicious, structural, branch_explore_flag, structural_reasons in word_candidates:
-        # Initialize debug entry for this word
-        word_debug = None
-        if debug_info is not None:
-            # Collect tokenization info for this word
-            tokenization = [lm.tokenizer.decode([t["actual_id"]]) for t in word_tokens]
-            token_ids = [t["actual_id"] for t in word_tokens]
-            token_probs = [t["actual_prob"] for t in word_tokens]
-            token_log_probs = [t["actual_log_prob"] for t in word_tokens]
-            word_surprisal = -sum(token_log_probs) / len(token_log_probs) if token_log_probs else 0.0
-            suspicious_indices = [i for i, t in enumerate(word_tokens) if t["actual_prob"] < TOKEN_PROB_FLOOR]
-
-            word_debug = WordDebug(
-                word=word, start=ws, end=we,
-                tokenization=tokenization,
-                token_ids=token_ids,
-                token_probs=token_probs,
-                word_surprisal=word_surprisal,
-                suspicious_tokens=suspicious_indices,
-                structural_match=structural,
-                structural_reasons=structural_reasons,
-                branch_explore=branch_explore_flag,
-            )
-            debug_info.words_analyzed.append(word_debug)
-
-        # Correction candidates from softmax top-k
-        seen: set[str] = {word.lower()}
-        softmax_cands: list[str] = []
-        heuristic_cands: list[str] = []
-
-        # Softmax-based corrections (only when we have suspicious tokens)
-        if suspicious:
-            for rank in range(3):
-                c = _build_correction(word, ws, we, word_tokens, suspicious, rank=rank)
-                cl = c.lower()
-                if c and cl not in seen and cl != word.lower():
-                    softmax_cands.append(c)
-                    seen.add(cl)
-
-        # Heuristic corrections from the OCR confusion map.
-        for c in _heuristic_candidates(word):
-            cl = c.lower()
-            if cl not in seen:
-                heuristic_cands.append(c)
-                seen.add(cl)
-
-        cands = softmax_cands + heuristic_cands
-
-        if word_debug is not None:
-            word_debug.softmax_candidates = list(softmax_cands)
-            word_debug.heuristic_candidates = list(heuristic_cands)
-            word_debug.candidates_generated = list(cands)
-            word_debug.candidates_pre_filter = list(cands)
-
-        if not cands:
-            if word_debug is not None:
-                word_debug.outcome = "no_candidates"
-                word_debug.outcome_reason = "No correction candidates could be generated for this word"
-            continue
-
-        # Similarity filter: OCR corrections must resemble the original.
-        # "br0wn"→"brown" (0.8) passes; "material"→"coffee" (0.14) is filtered.
-        cands = [
-            c for c in cands
-            if SequenceMatcher(None, word.lower(), c.lower()).ratio() > SIMILARITY_FLOOR
-        ]
-        # Shape filter — different rules for structural vs alpha-only words:
-        #   * Structural (digit-in-alpha, rn-doubling, etc.): an OCR error
-        #     shrinks "cornrnitrnent" (13) → "commitment" (10). Length and
-        #     edit distance can be large, so we only keep the ratio filter
-        #     above and add no further shape constraint here.
-        #   * Alpha-only (no structural marker): real OCR errors in pure-alpha
-        #     words overwhelmingly preserve length (1-char swap like teh↔the,
-        #     glyph flips like hlelo↔hello). Require same length AND edit
-        #     distance ≤ 2. This kills common-word paraphrases like
-        #     "for"→"from", "washed"→"was", "community"→"city".
-        if not structural:
-            # Allow small length shifts (±2) so OCR-specific transforms
-            # like d→cl (endose→enclose, disdose→disclose) survive when
-            # the LM flags the word but no structural pattern matched.
-            # Edit distance ≤ 2 still blocks wild paraphrases.
-            cands = [
-                c for c in cands
-                if abs(len(c) - len(word)) <= 2 and _edit_distance(word, c) <= 2
-            ]
-
-        if word_debug is not None:
-            word_debug.candidates_after_filter = list(cands)
-
-        if not cands:
-            log.info("  %s → no similar corrections, skipping", word)
-            if word_debug is not None:
-                word_debug.outcome = "filtered_no_similar"
-                word_debug.outcome_reason = "All candidates filtered out by similarity/shape constraints"
-            continue
-
-        # Score [original, *corrections] by full-text log-prob
-        all_cands = [word] + cands
-        scores, raw_lps = _score_candidates(text, ws, we, all_cands)
-
-        # Compute the log-prob improvement from the best correction
-        improvement = max(raw_lps[1:]) - raw_lps[0] if len(raw_lps) > 1 else 0.0
-
-        log.info(
-            "  %s → candidates: %s  scores: %s  improvement: %.1f nats",
-            word, all_cands, scores, improvement,
-        )
-
-        if word_debug is not None:
-            word_debug.scores = dict(zip(all_cands, scores))
-            word_debug.raw_log_probs = dict(zip(all_cands, raw_lps))
-            word_debug.improvement = improvement
-
-        # False-positive filter:
-        #   1. Original must lose (correction scores higher)
-        #   2. The log-prob improvement must be substantial (MIN_LP_GAIN nats).
-        #      Real OCR fixes produce huge gains (10+); stylistic paraphrases
-        #      produce small gains (1-3) and we want those filtered.
-        #   3. Structural matches bypass the LP-gain floor — we already have
-        #      strong prior evidence (digit-in-alpha, rn-doubling, etc.).
-        best_corr = max(scores[1:], default=0)
-        if scores and scores[0] >= best_corr:
-            log.info("  → false positive (original wins)")
-            if word_debug is not None:
-                word_debug.outcome = "fp_original_wins"
-                word_debug.outcome_reason = f"Original word scored {scores[0]:.3f} >= best correction {best_corr:.3f}"
-            continue
-        if not structural:
-            # When the only signal is softmax probability and the surface form
-            # is a plausible English word, require a much larger gain to flag.
-            # The stronger base model (Qwen3) produces 6-10 nat gains on
-            # natural paraphrase swaps, so we keep the bar high.
-            gain_threshold = MIN_LP_GAIN
-            if _looks_like_common_word(word):
-                gain_threshold = max(gain_threshold, 10.0)
-            if improvement < gain_threshold:
-                log.info(
-                    "  → false positive (improvement %.1f < %.1f)",
-                    improvement, gain_threshold,
-                )
-                if word_debug is not None:
-                    word_debug.outcome = f"fp_low_gain ({improvement:.1f} < {gain_threshold:.1f})"
-                    word_debug.outcome_reason = f"Log-prob improvement {improvement:.1f} nats below threshold {gain_threshold:.1f}"
-                continue
-
-        # Build suggestions sorted by score. Always preserve the top-2
-        # candidates regardless of score so that a heavily-diluted top
-        # correction (e.g. "rebel" diluted across many sibling candidates
-        # for "rebe1") still surfaces. Below top-2, drop very low scores.
-        ranked = sorted(
-            zip(cands, scores[1:]), key=lambda cs: cs[1], reverse=True,
-        )
-        suggestions = [
-            Suggestion(text=c, score=s)
-            for i, (c, s) in enumerate(ranked)
-            if i < 2 or s >= 0.01
-        ]
-        if suggestions:
-            spans.append(Span(
-                start=ws, end=we, text=word,
-                kind="probable_ocr_error",
-                suggestions=suggestions,
-            ))
-            if word_debug is not None:
-                best_suggestion = suggestions[0]
-                word_debug.outcome = "flagged"
-                word_debug.outcome_reason = f"OCR error detected, best suggestion '{best_suggestion.text}' with score {best_suggestion.score:.3f}"
+    if debug_info is not None:
+        debug_info.beam_search = beam_debug
 
     if not spans:
-        return CheckResponse(result="ok", score=round(0.85, 3), spans=[], debug=debug_info)
+        # No corrections found or original was best
+        if preds:
+            min_prob = min(t["actual_prob"] for t in preds)
+            margin = min(min_prob / TOKEN_PROB_FLOOR, 1.0) if TOKEN_PROB_FLOOR > 0 else 1.0
+            conf = 0.80 + 0.19 * min(margin, 1.0)
+        else:
+            conf = 0.95
+        return CheckResponse(result="ok", score=round(conf, 3), spans=[], debug=debug_info)
 
-    best_suggestion_score = max(
-        s.score for span in spans for s in span.suggestions
-    ) if spans else 0.5
-    conf = 0.80 + 0.19 * min(best_suggestion_score, 1.0)
+    # Compute confidence from improvement
+    if beam_debug and beam_debug.improvement_over_original > 0:
+        # Scale improvement to confidence: 10 nats → ~0.95, 20+ nats → ~0.99
+        improvement = beam_debug.improvement_over_original
+        conf = 0.80 + 0.19 * min(improvement / 20.0, 1.0)
+    else:
+        conf = 0.85
+
     return CheckResponse(
         result="issue_detected", score=round(conf, 3), spans=spans, debug=debug_info,
     )

@@ -263,9 +263,9 @@ def run_continuation_check(first: str, second: str, debug: bool = False) -> dict
 
 
 def analyze_ocr_failure(test_case: TestCase, result: dict) -> FailureAnalysis:
-    """Analyze why an OCR test case failed."""
+    """Analyze why an OCR test case failed using beam search debug info."""
     debug_info = result.get("debug", {})
-    words_analyzed = debug_info.get("words_analyzed", []) if debug_info else []
+    beam_search = debug_info.get("beam_search", {}) if debug_info else {}
 
     analysis = FailureAnalysis(
         test_id=test_case.test_id,
@@ -279,29 +279,89 @@ def analyze_ocr_failure(test_case: TestCase, result: dict) -> FailureAnalysis:
         debug_info=debug_info,
     )
 
-    # Find the word in analyzed words
-    word_debug = None
-    for w in words_analyzed:
-        if w.get("word", "").lower() == test_case.error_word.lower():
-            word_debug = w
+    if not beam_search:
+        analysis.word_found = False
+        analysis.reason = "no_beam_search_debug"
+        return analysis
+
+    # Check if any patterns were found that could lead to our expected correction
+    patterns = beam_search.get("patterns_found", [])
+    error_word_patterns = []
+    for p in patterns:
+        # Check if pattern is within the error word's position in the text
+        pat_text = test_case.text[p.get("start", 0):p.get("end", 0)]
+        if test_case.error_word.lower().find(p.get("pattern_key", "").lower()) >= 0:
+            error_word_patterns.append(p)
+
+    if not patterns:
+        analysis.word_found = False
+        analysis.reason = "no_patterns_found"
+        return analysis
+
+    analysis.word_found = True  # Patterns were found and analyzed
+
+    # Check final beams for our expected correction
+    final_beams = beam_search.get("final_beam_states", [])
+    original_log_prob = beam_search.get("original_log_prob", 0.0)
+    analysis.original_score = original_log_prob
+
+    # Look for a beam that produces the expected correction
+    best_beam = final_beams[0] if final_beams else None
+    expected_beam = None
+
+    for beam in final_beams:
+        corrections = beam.get("corrections", [])
+        # Check if any correction produces the expected result
+        for start, end, orig, repl in corrections:
+            if orig.lower() == test_case.error_word.lower() or \
+               (test_case.error_word.lower() in test_case.text[start:end].lower()):
+                if repl.lower() == test_case.expected_correction.lower():
+                    expected_beam = beam
+                    break
+        if expected_beam:
             break
 
-    if word_debug:
-        analysis.word_found = True
-        analysis.tokenization_original = word_debug.get("tokenization", [])
-        analysis.reason = word_debug.get("outcome", "unknown")
-        analysis.original_score = word_debug.get("scores", {}).get(test_case.error_word, 0.0)
-        analysis.correction_score = word_debug.get("scores", {}).get(test_case.expected_correction, 0.0)
-        analysis.log_prob_improvement = word_debug.get("improvement", 0.0)
-
-        # Check if word was flagged
-        for span in analysis.spans:
-            if span.get("text", "").lower() == test_case.error_word.lower():
-                analysis.word_flagged = True
+    # Also check corrected_text for the expected correction
+    if not expected_beam:
+        for beam in final_beams:
+            corrected = beam.get("corrected_text", "")
+            if test_case.expected_correction.lower() in corrected.lower() and \
+               test_case.error_word.lower() not in corrected.lower():
+                expected_beam = beam
                 break
+
+    if expected_beam:
+        analysis.correction_score = expected_beam.get("log_prob", 0.0)
+        analysis.log_prob_improvement = analysis.correction_score - original_log_prob
+
+        # Check if it was the best beam
+        if best_beam and best_beam.get("beam_id") == expected_beam.get("beam_id"):
+            analysis.word_flagged = True
+            analysis.reason = "flagged_correctly"
+        else:
+            # Expected correction exists but wasn't chosen
+            best_lp = best_beam.get("log_prob", 0.0) if best_beam else 0.0
+            expected_lp = expected_beam.get("log_prob", 0.0)
+            if best_beam and best_beam.get("is_original"):
+                analysis.reason = f"original_beat_correction (orig={original_log_prob:.2f}, corr={expected_lp:.2f})"
+            else:
+                analysis.reason = f"wrong_correction_chosen (best={best_lp:.2f}, expected={expected_lp:.2f})"
     else:
-        analysis.word_found = False
-        analysis.reason = "word_not_analyzed"
+        # Expected correction wasn't in any beam
+        # Check if pattern was even found
+        found_relevant_pattern = False
+        for p in patterns:
+            key = p.get("pattern_key", "")
+            # Check common OCR patterns that could produce this correction
+            if key in test_case.error_word.lower():
+                found_relevant_pattern = True
+                break
+
+        if not found_relevant_pattern:
+            analysis.reason = f"pattern_not_detected (error_word='{test_case.error_word}')"
+        else:
+            # Pattern found but correction not generated
+            analysis.reason = f"correction_not_in_beams (patterns={len(patterns)}, beams={len(final_beams)})"
 
     return analysis
 
@@ -483,6 +543,91 @@ def generate_continuation_summary(
             f.write("\n")
 
 
+def print_verbose_beam_debug(test_case: TestCase, result: dict) -> None:
+    """Print verbose beam search debug info for a test case."""
+    debug = result.get("debug", {})
+    beam_search = debug.get("beam_search", {})
+
+    print(f"\n{'='*70}")
+    print(f"TEST: {test_case.test_id}")
+    print(f"INPUT: {test_case.text}")
+    print(f"EXPECTED: '{test_case.error_word}' → '{test_case.expected_correction}'")
+    print(f"{'='*70}")
+
+    if not beam_search:
+        print("  [NO BEAM SEARCH DEBUG INFO]")
+        return
+
+    # Original text score
+    orig_lp = beam_search.get("original_log_prob", 0.0)
+    print(f"\nORIGINAL LOG-PROB: {orig_lp:.2f}")
+
+    # Patterns found
+    patterns = beam_search.get("patterns_found", [])
+    print(f"\nPATTERNS FOUND: {len(patterns)}")
+    for i, p in enumerate(patterns):
+        print(f"  [{i}] '{p.get('original_text', '')}' @ {p.get('start')}-{p.get('end')}")
+        print(f"      pattern_key: '{p.get('pattern_key', '')}'")
+        print(f"      replacements: {p.get('replacements', [])}")
+
+    # Prune events
+    prune_events = beam_search.get("prune_events", [])
+    if prune_events:
+        print(f"\nPRUNE EVENTS: {len(prune_events)}")
+        for pe in prune_events:
+            print(f"  after pattern {pe.get('after_pattern_idx')}: '{pe.get('pattern_key')}'")
+            print(f"    beams: {pe.get('beams_before')} → {pe.get('beams_after')}")
+
+    # Final beams
+    final_beams = beam_search.get("final_beam_states", [])
+    print(f"\nFINAL BEAMS: {len(final_beams)} (sorted by log-prob)")
+    for i, beam in enumerate(final_beams[:10]):  # Show top 10
+        is_orig = beam.get("is_original", False)
+        lp = beam.get("log_prob", 0.0)
+        diff = lp - orig_lp
+        marker = "← ORIGINAL" if is_orig else ""
+        winner = "★ WINNER" if i == 0 else ""
+
+        print(f"\n  [{i}] beam_id={beam.get('beam_id')} log_prob={lp:.2f} (Δ={diff:+.2f}) {winner} {marker}")
+
+        corrections = beam.get("corrections", [])
+        if corrections:
+            print(f"      corrections:")
+            for start, end, orig, repl in corrections:
+                print(f"        @{start}-{end}: '{orig}' → '{repl}'")
+        else:
+            print(f"      (no corrections)")
+
+        # Show snippet of corrected text
+        corrected = beam.get("corrected_text", "")
+        if corrected and not is_orig:
+            print(f"      text: {corrected[:80]}{'...' if len(corrected) > 80 else ''}")
+
+    # Best beam info
+    print(f"\nBEST BEAM: {beam_search.get('best_beam_id')}")
+    print(f"IMPROVEMENT: {beam_search.get('improvement_over_original', 0):.2f} nats")
+
+    corrections_applied = beam_search.get("corrections_applied", [])
+    if corrections_applied:
+        print(f"CORRECTIONS APPLIED:")
+        for start, end, orig, repl in corrections_applied:
+            print(f"  @{start}-{end}: '{orig}' → '{repl}'")
+
+    # Check if expected correction is in any beam
+    print(f"\nEXPECTED CORRECTION '{test_case.expected_correction}' IN BEAMS?")
+    found_in = []
+    for beam in final_beams:
+        corrected = beam.get("corrected_text", "").lower()
+        if test_case.expected_correction.lower() in corrected:
+            found_in.append(beam.get("beam_id"))
+    if found_in:
+        print(f"  YES, in beams: {found_in}")
+    else:
+        print(f"  NO - not found in any beam")
+
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze TextSureOCR test failures")
     parser.add_argument("--test-file", nargs="+", help="Path(s) to test file(s) to analyze")
@@ -493,6 +638,7 @@ def main():
     parser.add_argument("--limit", type=int, help="Limit number of tests to analyze")
     parser.add_argument("--quiet", "-q", action="store_true", help="Only show failures, not passes")
     parser.add_argument("--failures-only", action="store_true", help="Stop collecting debug on pass (faster)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Print verbose beam search debug for each failure")
     args = parser.parse_args()
 
     # Determine test files to process
@@ -645,6 +791,10 @@ def main():
                             print(f"  FAIL: {tc.test_id} ({analysis.reason})")
                         else:
                             print(f"FAILED ({analysis.reason})")
+
+                        # Print verbose beam search debug if requested
+                        if args.verbose:
+                            print_verbose_beam_debug(tc, result)
 
                         # Write to JSONL
                         record = {
