@@ -50,7 +50,7 @@ MIN_LP_GAIN      = float(os.getenv("TEXTSURE_MIN_LP_GAIN", "4.0"))
 SIMILARITY_FLOOR = float(os.getenv("TEXTSURE_SIMILARITY_FLOOR", "0.5"))
 TOP_K            = 5
 MIN_WORD_LEN     = 2
-MAX_HEURISTIC_CANDIDATES = 8
+MAX_HEURISTIC_CANDIDATES = 14
 
 # OCR character confusion map: glyphs often misread as each other.
 # Keys are sequences we find in suspect words; values are plausible true readings.
@@ -63,11 +63,32 @@ CONFUSIONS: dict[str, list[str]] = {
     "2":  ["Z"],
     "rn": ["m"],
     "vv": ["w"],
+    # "cl" and "d" are mutually-confusable: print "cl" can scan as "d"
+    # (include→indude) and vice-versa. We want candidates in both
+    # directions, so list both keys; _heuristic_candidates takes the
+    # union of matches.
     "cl": ["d"],
+    "d":  ["cl"],
     "|":  ["l", "I"],
     "rri":["m"],
     "I":  ["l"],   # capital-I scanned for lowercase-l (faciIity → facility)
+    # ── rrn: doubled-r artifact when m→rn adjacent to an r ──
+    # (burrn→burn, harrn→harm, confrrn→confirm, storrn→storm)
+    "rrn": ["rn", "rm"],
+    # ── fi-ligature garble: fi scans as ft or fm ──
+    # (ftre→fire, fmd→find, ftnal→final). Some cases need length-
+    # changing substitutions (fmd→find: 3→4 chars, "m" → "in").
+    "ft": ["fi"],
+    "fm": ["fi", "fin"],
 }
+
+# Corrections that require position-specific matching, kept separate
+# from CONFUSIONS so we don't generate noisy candidates on every "d"
+# in the document. Applied only when the containing word is
+# structurally suspicious (non-dictionary shape near a morpheme).
+_D_FOR_CL_MORPHEMES = (
+    "de", "da", "du",   # prefix-ish: indude/declare/reduce
+)
 
 log = logging.getLogger("textsure")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -255,28 +276,147 @@ def _first_word(text: str) -> str:
 
 # A word is structurally suspicious if it:
 #   (a) mixes alphabetic characters with digits (schoo1, c0mputer, 1etter)
-#   (b) contains a doubled "rn" pattern (cornrnitrnent, governrnent)
+#   (b) contains an "rn" inside a word and isn't a known -rn word
+#       (governrnent, hurnan, rnedical — catches single and doubled rn)
 #   (c) contains "vv" inside an alpha run (vvord → word)
 #   (d) contains a pipe among letters (he|lo)
+#   (e) capital I next to lowercase (faciIity, additionaI)
+#   (f) word-initial "ft" or "fm" followed by alpha — fi-ligature garble
+#   (g) "rrn" or "rrm" — doubled-r m-substitution artifact
+#   (h) "d" between vowels inside a non-dictionary shape — cl→d OCR
 _DIGIT_IN_ALPHA = re.compile(r"[A-Za-z][0-9]|[0-9][A-Za-z]")
-_RN_DOUBLED     = re.compile(r"rn.*rn", re.IGNORECASE)
+_RN_IN_ALPHA    = re.compile(r"[A-Za-z]rn[A-Za-z]", re.IGNORECASE)
 _VV_IN_ALPHA    = re.compile(r"[A-Za-z]vv|vv[A-Za-z]")
 _PIPE_IN_ALPHA  = re.compile(r"[A-Za-z]\||\|[A-Za-z]")
-# Capital I appearing inside a lowercase alpha run (faciIity, additionaI, Iate).
 _CAP_I_IN_ALPHA = re.compile(r"[a-z]I|I[a-z]")
+_FI_GARBLE      = re.compile(r"^f[tm][a-z]|[a-z]f[tm][a-z]", re.IGNORECASE)
+_RRN_DOUBLED    = re.compile(r"rr[nm]", re.IGNORECASE)
+# "d" sandwiched between vowels (indude, dedare, exdude, prodaim).
+# Real English "-ede-/-ade-/-ode-/-ude-/-ide-" patterns (made, side, wide,
+# ride, hide, blade, spade, node, code, dude) are common, so we only
+# mark this structural when the word doesn't exist in the safe list.
+_D_BETWEEN_VOWELS = re.compile(r"(?i)[a-z]+?[aeiou]d[aeiou]")
 # Word that contains zero alphabetic characters — pure digits/punctuation
 # like "16", "750", "--", "555-0140". Not OCR-checkable as a "word".
 _NO_ALPHA       = re.compile(r"^[^A-Za-z]+$")
 
+# Legitimate English words that contain "rn" — these should NOT trip
+# the single-rn structural flag. Generous to avoid false positives;
+# the downstream LP-gain filter will re-check anyway.
+_RN_SAFE_WORDS = frozenset({
+    # verbs / nouns with rn
+    "corn", "born", "torn", "yarn", "worn", "horn", "barn", "earn",
+    "earns", "earned", "earning", "earnings", "earnest",
+    "learn", "learns", "learned", "learner", "learning",
+    "turn", "turns", "turned", "turning", "return", "returns",
+    "returned", "returning", "turnaround", "turnout", "turnover", "turnpike",
+    "burn", "burns", "burned", "burning", "burnt", "burner", "sunburn",
+    "concern", "concerns", "concerned", "concerning",
+    "pattern", "patterns", "patterned",
+    "modern", "modernity", "modernize",
+    "morning", "mornings",
+    "warning", "warnings",
+    "kernel", "kernels",
+    "journal", "journals", "journalist", "journalism",
+    "journey", "journeys", "journeyed",
+    "adorn", "adorns", "adorned", "adornment",
+    "thorn", "thorns", "thorny",
+    "scorn", "scorns", "scorned",
+    "mourn", "mourns", "mourned", "mourning", "mourner",
+    "stern", "sterns", "sternly",
+    "intern", "interns", "internal", "international", "internet",
+    "internally", "internally", "internship",
+    "govern", "governs", "governed", "governing", "government",
+    "governments", "governor", "governance",
+    "alternate", "alternating", "alternative", "alternatives",
+    "alternatively", "alternative",
+    "eastern", "western", "northern", "southern", "southwestern",
+    "northeastern", "northwestern", "southeastern",
+    "hibernate", "hibernation",
+    "subordinate", "coordinate", "coordination", "coordinator",
+    "tavern", "taverns", "cavern", "caverns", "cavernous",
+    "lantern", "lanterns",
+    "cornea", "corneal", "corner", "corners", "cornering",
+    "cornerstone", "cornerstones",
+    "garner", "garnered", "garnering",
+    "harness", "harnessed", "harnessing",
+    "earnest", "earnestly", "earnestness",
+    "tarnish", "tarnished", "tarnishing",
+    "furnish", "furnished", "furniture",
+    "girl", "girls",  # not rn but guard against false match (not needed)
+    "ornament", "ornamental", "ornate",
+    "supernova", "hornet", "hornets",
+    "bourne", "fortnight",
+    "discern", "discerning", "discerned",
+    "yearn", "yearns", "yearned", "yearning",
+    "spurn", "spurns", "spurned",
+    "cornflake", "cornflakes", "cornfield",
+    "marney", "barney", "journey",
+})
+
+# Words containing "d" between vowels that are legitimate English.
+# Used to gate the cl→d structural rule. Generous allow-list; bogus
+# candidates past this point are filtered by log-prob gain.
+_D_VOWEL_SAFE_WORDS = frozenset({
+    "made", "fade", "wade", "blade", "glade", "grade", "trade", "shade",
+    "spade", "upgrade", "degrade", "upgrade", "cascade", "decade",
+    "parade", "crusade", "invade", "evade", "pervade", "brigade",
+    "handmade", "homemade", "lemonade", "promenade",
+    "side", "ride", "hide", "tide", "wide", "bride", "pride", "slide",
+    "glide", "stride", "provide", "divide", "beside", "decide",
+    "outside", "inside", "upside", "aside", "reside", "subside",
+    "collide", "abide", "preside", "override", "landslide",
+    "node", "code", "mode", "rode", "erode", "bode", "abode", "episode",
+    "explode", "corrode", "anode", "diode", "methodology",
+    "dude", "rude", "crude", "etude", "nude", "allude", "elude",
+    "exclude", "include", "preclude", "conclude", "delude", "extrude",
+    "seclude", "intrude", "magnitude", "attitude", "altitude",
+    "ado", "dado",
+    "adobe", "adopt", "adore",
+    "medal", "metal", "modem",
+    "today", "today", "idea", "ideal", "ideally", "ideas",
+    "audio", "radio", "radios", "radius", "media", "medium",
+    "video", "videos", "codec", "model", "models",
+    "body", "lady", "shady", "windy", "study", "studies", "studied",
+    "ready", "already", "steady", "sturdy", "heady", "heady",
+    "video", "edit", "edits", "edited", "editor",
+    "udon", "udder", "idol", "idols", "idolize",
+    "adequate", "adequately", "adequacy",
+    "identify", "identical", "ideology",
+    "adobe", "odor", "odors", "odorous",
+    "under", "underneath", "udp",
+    "academic", "academy", "academies",
+    "advocacy", "adobe",
+})
+
+
+_STRIP_PUNCT = re.compile(r"^[^A-Za-z]+|[^A-Za-z]+$")
+
+
+def _core_word(word: str) -> str:
+    """Strip leading/trailing punctuation so 'commitment,' == 'commitment'."""
+    return _STRIP_PUNCT.sub("", word).lower()
+
 
 def _is_structurally_suspicious(word: str) -> bool:
-    return bool(
-        _DIGIT_IN_ALPHA.search(word)
-        or _RN_DOUBLED.search(word)
-        or _VV_IN_ALPHA.search(word)
-        or _PIPE_IN_ALPHA.search(word)
-        or _CAP_I_IN_ALPHA.search(word)
-    )
+    w = _core_word(word)
+    if _DIGIT_IN_ALPHA.search(word): return True
+    if _VV_IN_ALPHA.search(word):    return True
+    if _PIPE_IN_ALPHA.search(word):  return True
+    if _CAP_I_IN_ALPHA.search(word): return True
+    if _RRN_DOUBLED.search(word):    return True
+    if _FI_GARBLE.search(word):      return True
+    # Single-rn rule: flag any mid-word "rn" unless the word is in the
+    # English "-rn" allow-list. The allow-list is exact (not a prefix
+    # match) so "governrnent" still gets flagged even though it shares
+    # a prefix with "government".
+    if _RN_IN_ALPHA.search(word) and w not in _RN_SAFE_WORDS:
+        return True
+    # cl→d rule: "d" sandwiched between vowels in a word that isn't
+    # common English. Exact-word check only — no prefix matching.
+    if _D_BETWEEN_VOWELS.search(word) and w not in _D_VOWEL_SAFE_WORDS:
+        return True
+    return False
 
 
 def _occurrences(word: str, key: str) -> list[tuple[int, int]]:
@@ -468,6 +608,16 @@ def _ocr_check(text: str) -> CheckResponse:
             continue
 
         structural = _is_structurally_suspicious(word)
+
+        # LM veto for structural-only flags: if every token in the word
+        # has high actual probability, the LM is confident the word fits
+        # the context. Don't waste a candidate-scoring pass on it.
+        # This lets us keep the regex rules generous without flooding
+        # clean prose with false positives.
+        if structural and not suspicious:
+            min_prob = min(t["actual_prob"] for t in word_tokens)
+            if min_prob > 0.5:
+                structural = False
 
         if not suspicious and not structural:
             continue

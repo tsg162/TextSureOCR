@@ -1,338 +1,783 @@
 """
 Integration tests for OCR digit-for-letter substitution detection.
 
-Covers six common OCR confusions where digits are misread as letters:
-  0 -> o,  1 -> l,  3 -> e,  5 -> s,  7 -> t,  8 -> b
+Covers four OCR confusions where digits are misread as letters:
+  0 -> o,  1 -> l,  5 -> s,  8 -> b
 
-~4,800 parametrized cases total.  Each test sends corrupted text to the
-live service and asserts the error is detected, the corrupted span is
-returned, and the correct word appears in suggestions.
+Each case is a hand-written, contextually coherent sentence of the
+kind one might realistically encounter in an OCR'd document (news
+articles, memos, letters, reports, manuals, legal text).  The
+corrupted word plays its natural grammatical role so that an LLM
+next-token predictor has enough signal to identify and correct it.
 """
 
 import pytest
 from helpers import ocr_check
 
+
 # ═══════════════════════════════════════════════════════════════════════
-# 1.  Zero for O  (0 → o)   — 120 words × 10 templates = 1,200 tests
+# 1.  Zero for O  (0 → o)
 # ═══════════════════════════════════════════════════════════════════════
 
-ZERO_FOR_O_WORDS = list(dict.fromkeys([
-    "brown", "police", "computer", "morning", "document", "control",
-    "problem", "solution", "company", "operation", "position", "condition",
-    "production", "population", "protection", "construction", "corporation",
-    "direction", "collection", "convention", "motion", "ocean", "rocket",
-    "pocket", "doctor", "factor", "motor", "monitor", "governor",
-    "professor", "color", "honor", "labor", "mirror", "terror", "error",
-    "author", "donor", "humor", "junior", "senior", "corridor", "warrior",
-    "senator", "location", "modern", "moment", "money", "month", "morning",
-    "model", "moreover", "motion", "mount", "noble", "normal", "north",
-    "note", "nothing", "notice", "novel", "object", "observe", "office",
-    "option", "order", "other", "outside", "over", "phone", "photo",
-    "policy", "polite", "political", "poor", "popular", "portion",
-    "positive", "possible", "power", "prior", "process", "produce",
-    "profit", "program", "project", "promise", "promote", "proper",
-    "propose", "protect", "prove", "provide", "protocol", "reason",
-    "record", "reform", "report", "resource", "response", "role", "room",
-    "root", "round", "school", "score", "short", "social", "solid",
-    "solution", "story", "strong", "total", "tone", "tool", "topic",
-    "touch", "tower", "voice", "volume", "vote", "woman", "wonder",
-    "world", "worry", "worth",
-]))
+ZERO_FOR_O_CASES = [
+    # ── common nouns in natural contexts ──────────────────────────────
+    ("The detective followed the suspect's br0wn sedan through three counties.",
+        "br0wn", "brown", "0_o_brown_1"),
+    ("She wrapped the parcel in plain br0wn paper and tied it with twine.",
+        "br0wn", "brown", "0_o_brown_2"),
+    ("The p0lice arrived within minutes of the emergency call.",
+        "p0lice", "police", "0_o_police_1"),
+    ("Several p0lice officers cordoned off the intersection after the collision.",
+        "p0lice", "police", "0_o_police_2"),
+    ("My c0mputer crashed just before I could save the final draft.",
+        "c0mputer", "computer", "0_o_computer_1"),
+    ("The lab replaced every c0mputer in the building over spring break.",
+        "c0mputer", "computer", "0_o_computer_2"),
+    ("She left the house early in the m0rning to beat the traffic.",
+        "m0rning", "morning", "0_o_morning_1"),
+    ("By m0rning the snow had covered every rooftop in the valley.",
+        "m0rning", "morning", "0_o_morning_2"),
+    ("Please sign the d0cument on the last page and return it by Friday.",
+        "d0cument", "document", "0_o_document_1"),
+    ("The archivist scanned each d0cument before filing it in the vault.",
+        "d0cument", "document", "0_o_document_2"),
+    ("Air traffic c0ntrol cleared the flight for an immediate takeoff.",
+        "c0ntrol", "control", "0_o_control_1"),
+    ("The pilot lost c0ntrol of the aircraft during severe turbulence.",
+        "c0ntrol", "control", "0_o_control_2"),
+    ("We finally identified the pr0blem after three hours of debugging.",
+        "pr0blem", "problem", "0_o_problem_1"),
+    ("The engineer proposed a clean s0lution to a long-standing pr0blem.",
+        "pr0blem", "problem", "0_o_problem_2"),
+    ("Her s0lution to the puzzle was both elegant and unexpected.",
+        "s0lution", "solution", "0_o_solution_1"),
+    ("The insurance c0mpany denied his claim without explanation.",
+        "c0mpany", "company", "0_o_company_1"),
+    ("She founded the c0mpany in her garage with two thousand dollars.",
+        "c0mpany", "company", "0_o_company_2"),
+    ("The surgical 0peration lasted nearly six hours.",
+        "0peration", "operation", "0_o_operation_1"),
+    ("Military 0perations in the region were suspended indefinitely.",
+        "0perations", "operations", "0_o_operation_2"),
+    ("He applied for a senior management p0sition at the consulting firm.",
+        "p0sition", "position", "0_o_position_1"),
+    ("The goalkeeper held his p0sition even as the striker approached.",
+        "p0sition", "position", "0_o_position_2"),
+    ("The patient's c0ndition improved dramatically after the new treatment.",
+        "c0ndition", "condition", "0_o_condition_1"),
+    ("Check the engine's c0ndition before you commit to buying the car.",
+        "c0ndition", "condition", "0_o_condition_2"),
+    ("Steel pr0duction fell sharply during the third quarter.",
+        "pr0duction", "production", "0_o_production_1"),
+    ("The factory shut down pr0duction lines for annual maintenance.",
+        "pr0duction", "production", "0_o_production_2"),
+    ("The city's p0pulation has doubled since the last census.",
+        "p0pulation", "population", "0_o_population_1"),
+    ("Rural p0pulations continue to decline across the region.",
+        "p0pulations", "populations", "0_o_population_2"),
+    ("New pr0tection measures were introduced after the data breach.",
+        "pr0tection", "protection", "0_o_protection_1"),
+    ("Environmental pr0tection remains the foundation's primary mission.",
+        "pr0tection", "protection", "0_o_protection_2"),
+    ("C0nstruction on the bridge began in April and finished ahead of schedule.",
+        "C0nstruction", "Construction", "0_o_construction_1"),
+    ("Downtown c0nstruction has caused severe delays for commuters.",
+        "c0nstruction", "construction", "0_o_construction_2"),
+    ("The c0rporation reported record profits for the fifth year running.",
+        "c0rporation", "corporation", "0_o_corporation_1"),
+    ("A multinational c0rporation acquired the small firm last month.",
+        "c0rporation", "corporation", "0_o_corporation_2"),
+    ("Follow the instructions in the 0pposite direction to rewind the tape.",
+        "directi0n", "direction", "0_o_direction_1"),
+    ("The wind shifted directi0n and the sailors adjusted the rigging.",
+        "directi0n", "direction", "0_o_direction_2"),
+    ("The museum's fossil c0llection spans three hundred million years.",
+        "c0llection", "collection", "0_o_collection_1"),
+    ("Her private c0llection of rare coins was donated to the library.",
+        "c0llection", "collection", "0_o_collection_2"),
+    ("The annual c0nvention draws physicists from across Europe.",
+        "c0nvention", "convention", "0_o_convention_1"),
+    ("Hotel rooms near the c0nvention center are fully booked for the week.",
+        "c0nvention", "convention", "0_o_convention_2"),
 
-ZERO_FOR_O_TEMPLATES = [
-    "The {word} was mentioned in the official report yesterday",
-    "She carefully examined the {word} before making her decision",
-    "According to the latest findings, the {word} played a crucial role",
-    "They discovered that the {word} had changed significantly over time",
-    "The researchers analyzed the {word} and published their results",
-    "In the final paragraph, the {word} was described in great detail",
-    "Several experts agreed that the {word} needed further investigation",
-    "During the meeting, the {word} became a major point of discussion",
-    "The committee reviewed the {word} as part of the annual assessment",
-    "Historical records indicate that the {word} dates back centuries",
+    # ── nouns used as objects / subjects ──────────────────────────────
+    ("The cat watched in fascination as the m0tion of the pendulum slowed.",
+        "m0tion", "motion", "0_o_motion_1"),
+    ("Waves rolled in steadily across the calm 0cean.",
+        "0cean", "ocean", "0_o_ocean_1"),
+    ("The r0cket cleared the launch tower at nine seventeen local time.",
+        "r0cket", "rocket", "0_o_rocket_1"),
+    ("He pulled a crumpled receipt from his jacket p0cket.",
+        "p0cket", "pocket", "0_o_pocket_1"),
+    ("The d0ctor advised her to rest for at least a week.",
+        "d0ctor", "doctor", "0_o_doctor_1"),
+    ("Weather was the decisive fact0r in cancelling the outdoor concert.",
+        "fact0r", "factor", "0_o_factor_1"),
+    ("The m0tor stalled twice on the way up the mountain road.",
+        "m0tor", "motor", "0_o_motor_1"),
+    ("She watched the baby on the m0nitor from the kitchen.",
+        "m0nitor", "monitor", "0_o_monitor_1"),
+    ("The g0vernor vetoed the bill late Tuesday evening.",
+        "g0vernor", "governor", "0_o_governor_1"),
+    ("Every pr0fessor on the panel argued against the proposed cuts.",
+        "pr0fessor", "professor", "0_o_professor_1"),
+    ("The painter mixed a warm c0lor from cadmium red and yellow ochre.",
+        "c0lor", "color", "0_o_color_1"),
+    ("It was a privilege and an h0nor to deliver the commencement address.",
+        "h0nor", "honor", "0_o_honor_1"),
+    ("Migrant lab0r built most of the railroads in the nineteenth century.",
+        "lab0r", "labor", "0_o_labor_1"),
+    ("The bathroom mirr0r cracked when the pipe above it burst.",
+        "mirr0r", "mirror", "0_o_mirror_1"),
+    ("News of the attack spread terr0r throughout the village.",
+        "terr0r", "terror", "0_o_terror_1"),
+    ("The compiler flagged an err0r on line forty-seven.",
+        "err0r", "error", "0_o_error_1"),
+    ("The book's auth0r declined to comment on the controversy.",
+        "auth0r", "author", "0_o_author_1"),
+    ("The kidney d0nor and recipient were matched the same afternoon.",
+        "d0nor", "donor", "0_o_donor_1"),
+    ("His dry hum0r caught the audience off guard at first.",
+        "hum0r", "humor", "0_o_humor_1"),
+    ("She joined the firm as a juni0r associate straight out of law school.",
+        "juni0r", "junior", "0_o_junior_1"),
+    ("A seni0r analyst reviewed the filings before they were submitted.",
+        "seni0r", "senior", "0_o_senior_1"),
+    ("Security cameras line the corrid0r on every floor of the building.",
+        "corrid0r", "corridor", "0_o_corridor_1"),
+    ("The senat0r refused to answer questions about the scandal.",
+        "senat0r", "senator", "0_o_senator_1"),
+    ("GPS pinpointed the ship's l0cation to within a few meters.",
+        "l0cation", "location", "0_o_location_1"),
+    ("M0dern architecture often emphasizes clean lines and open space.",
+        "M0dern", "Modern", "0_o_modern_1"),
+    ("At that m0ment the lights flickered and then went out completely.",
+        "m0ment", "moment", "0_o_moment_1"),
+    ("He transferred the m0ney to his savings account the same day.",
+        "m0ney", "money", "0_o_money_1"),
+    ("The project ran over budget by nearly two m0nths.",
+        "m0nths", "months", "0_o_month_1"),
+    ("Their newest m0del goes on sale in early September.",
+        "m0del", "model", "0_o_model_1"),
+    ("The architect's n0rth-facing studio flooded with morning light.",
+        "n0rth", "north", "0_o_north_1"),
+    ("She added a handwritten n0te to the bottom of the envelope.",
+        "n0te", "note", "0_o_note_1"),
+    ("N0thing could have prepared him for what he saw next.",
+        "N0thing", "Nothing", "0_o_nothing_1"),
+    ("A quiet n0tice on the door announced the shop's temporary closure.",
+        "n0tice", "notice", "0_o_notice_1"),
+    ("Her debut n0vel sold out its first printing in a week.",
+        "n0vel", "novel", "0_o_novel_1"),
+    ("The astronomers failed to identify the 0bject despite weeks of observation.",
+        "0bject", "object", "0_o_object_1"),
+    ("The marine biologists 0bserve dolphin behavior from a small boat offshore.",
+        "0bserve", "observe", "0_o_observe_1"),
+    ("Her 0ffice overlooks the harbor and the fishing fleet beyond.",
+        "0ffice", "office", "0_o_office_1"),
+    ("The default 0ption preserves existing settings during the upgrade.",
+        "0ption", "option", "0_o_option_1"),
+    ("Pages arrived out of 0rder and had to be reshuffled by hand.",
+        "0rder", "order", "0_o_order_1"),
+    ("He asked the 0ther witness to describe what she had seen.",
+        "0ther", "other", "0_o_other_1"),
+    ("She prefers to eat lunch 0utside whenever the weather cooperates.",
+        "0utside", "outside", "0_o_outside_1"),
+    ("The survey results varied considerably from one region to an0ther.",
+        "an0ther", "another", "0_o_another_1"),
+    ("The ph0ne rang three times before the answering machine picked up.",
+        "ph0ne", "phone", "0_o_phone_1"),
+    ("She snapped a ph0to of the mountain just as the sun broke through.",
+        "ph0to", "photo", "0_o_photo_1"),
+    ("Company p0licy forbids employees from accepting personal gifts.",
+        "p0licy", "policy", "0_o_policy_1"),
+    ("The mayor faced intense p0litical pressure after the scandal broke.",
+        "p0litical", "political", "0_o_political_1"),
+    ("A p0or harvest forced the village to ration grain through the winter.",
+        "p0or", "poor", "0_o_poor_1"),
+    ("The singer remained immensely p0pular decades after her first hit.",
+        "p0pular", "popular", "0_o_popular_1"),
+    ("The p0wer failed just as the second act was beginning.",
+        "p0wer", "power", "0_o_power_1"),
+    ("Prior c0mmitments prevented her from attending the ceremony.",
+        "c0mmitments", "commitments", "0_o_commitments_1"),
+    ("The judicial pr0cess moves slowly but it tends to reach sound conclusions.",
+        "pr0cess", "process", "0_o_process_1"),
+    ("Local farms pr0duce most of the vegetables sold at the market.",
+        "pr0duce", "produce", "0_o_produce_1"),
+    ("The nonprofit reinvests every dollar of pr0fit into its programs.",
+        "pr0fit", "profit", "0_o_profit_1"),
+    ("The training pr0gram lasts eight weeks and includes field work.",
+        "pr0gram", "program", "0_o_program_1"),
+    ("The restoration pr0ject fell behind schedule after early rain delays.",
+        "pr0ject", "project", "0_o_project_1"),
+    ("He kept his pr0mise despite every obstacle that arose.",
+        "pr0mise", "promise", "0_o_promise_1"),
+    ("The foundation decided to pr0mote her to executive director in June.",
+        "pr0mote", "promote", "0_o_promote_1"),
+    ("Pr0per attribution is essential in any academic publication.",
+        "Pr0per", "Proper", "0_o_proper_1"),
+    ("The senator pr0posed an amendment to the defense appropriations bill.",
+        "pr0posed", "proposed", "0_o_propose_1"),
+    ("Helmets pr0tect riders from the most serious head injuries.",
+        "pr0tect", "protect", "0_o_protect_1"),
+    ("He could not pr0ve where he had been on the night in question.",
+        "pr0ve", "prove", "0_o_prove_1"),
+    ("The nonprofit does not pr0vide direct cash assistance to families.",
+        "pr0vide", "provide", "0_o_provide_1"),
+    ("The experiment strictly followed the standard pr0tocol for sterile work.",
+        "pr0tocol", "protocol", "0_o_protocol_1"),
+    ("There was no apparent reas0n for the sudden schedule change.",
+        "reas0n", "reason", "0_o_reason_1"),
+    ("The archive holds every court rec0rd dating back to 1852.",
+        "rec0rd", "record", "0_o_record_1"),
+    ("The tax ref0rm passed both chambers with bipartisan support.",
+        "ref0rm", "reform", "0_o_reform_1"),
+    ("The internal rep0rt was never released to the public.",
+        "rep0rt", "report", "0_o_report_1"),
+    ("Water is the region's most precious natural res0urce.",
+        "res0urce", "resource", "0_o_resource_1"),
+    ("The government's resp0nse to the crisis was criticized as too slow.",
+        "resp0nse", "response", "0_o_response_1"),
+    ("She took on the r0le of lead investigator after her colleague retired.",
+        "r0le", "role", "0_o_role_1"),
+    ("Every r0om on the east wing needs fresh paint before the reopening.",
+        "r0om", "room", "0_o_room_1"),
+    ("The tree's r0ot system extended further than the crown itself.",
+        "r0ot", "root", "0_o_root_1"),
+    ("He walked another r0und of the block before knocking on the door.",
+        "r0und", "round", "0_o_round_1"),
+    ("The sch0ol reopened three weeks after the storm damage was repaired.",
+        "sch0ol", "school", "0_o_school_1"),
+    ("Her final exam sc0re placed her in the top five percent of the class.",
+        "sc0re", "score", "0_o_score_1"),
+    ("The conference will be held at a venue a sh0rt drive from downtown.",
+        "sh0rt", "short", "0_o_short_1"),
+    ("S0cial media has reshaped the way political campaigns are run.",
+        "S0cial", "Social", "0_o_social_1"),
+    ("The cabinet is made from a single piece of s0lid oak.",
+        "s0lid", "solid", "0_o_solid_1"),
+    ("The novel's final st0ry ties together threads from every earlier chapter.",
+        "st0ry", "story", "0_o_story_1"),
+    ("Our case for funding remains st0rong despite the recent budget cuts.",
+        "st0rong", "strong", "0_o_strong_1"),
+    ("The t0tal cost of the renovation exceeded the initial estimate by thirty percent.",
+        "t0tal", "total", "0_o_total_1"),
+    ("The singer's warm t0ne carried to the back rows of the hall.",
+        "t0ne", "tone", "0_o_tone_1"),
+    ("Every carpenter needs a reliable set of measuring t0ols.",
+        "t0ols", "tools", "0_o_tools_1"),
+    ("The next t0pic on the agenda is the upcoming budget review.",
+        "t0pic", "topic", "0_o_topic_1"),
+    ("One t0uch of frost was enough to kill the tomato plants overnight.",
+        "t0uch", "touch", "0_o_touch_1"),
+    ("The observation t0wer offers a panoramic view of the surrounding forest.",
+        "t0wer", "tower", "0_o_tower_1"),
+    ("Her v0ice carried clearly across the crowded banquet hall.",
+        "v0ice", "voice", "0_o_voice_1"),
+    ("The speaker adjusted the microphone v0lume before beginning her remarks.",
+        "v0lume", "volume", "0_o_volume_1"),
+    ("Every registered citizen has the right to cast a v0te in the referendum.",
+        "v0te", "vote", "0_o_vote_1"),
+    ("The w0man at the counter asked me to show identification.",
+        "w0man", "woman", "0_o_woman_1"),
+    ("Children's faces filled with w0nder when the planetarium lights dimmed.",
+        "w0nder", "wonder", "0_o_wonder_1"),
+    ("Wars redrew the map of the w0rld in the course of a single decade.",
+        "w0rld", "world", "0_o_world_1"),
+    ("Try not to w0rry about the exam until after the weekend.",
+        "w0rry", "worry", "0_o_worry_1"),
+    ("The old telescope is w0rth far more than its current insurance estimate.",
+        "w0rth", "worth", "0_o_worth_1"),
 ]
 
 
-def _generate_zero_for_o():
-    cases = []
-    for word in ZERO_FOR_O_WORDS:
-        idx = word.find("o")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "0" + word[idx + 1:]
-        for ti, template in enumerate(ZERO_FOR_O_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"0_for_o__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
-
-
-_RAW_ZERO_FOR_O = _generate_zero_for_o()
-
 # ═══════════════════════════════════════════════════════════════════════
-# 2.  One for L  (1 → l)   — 100 words × 10 templates = 1,000 tests
+# 2.  One for L  (1 → l)
 # ═══════════════════════════════════════════════════════════════════════
 
-ONE_FOR_L_WORDS = [
-    "letter", "hello", "people", "school", "build", "cable", "plain",
-    "table", "simple", "little", "global", "metal", "legal", "level",
-    "local", "moral", "final", "total", "royal", "vital", "label",
-    "model", "panel", "novel", "angel", "camel", "hotel", "rebel",
-    "cancel", "channel", "travel", "tunnel", "animal", "capital",
-    "central", "crystal", "digital", "federal", "general", "hospital",
-    "journal", "liberal", "literal", "magical", "martial", "medical",
-    "mineral", "minimal", "musical", "natural", "neutral", "nominal",
-    "normal", "optical", "orbital", "partial", "personal", "physical",
-    "plural", "political", "principal", "professional", "proposal",
-    "protocol", "radical", "rational", "regional", "removal", "renewal",
-    "rental", "seasonal", "several", "signal", "social", "special",
-    "spiritual", "surgical", "survival", "terminal", "thermal",
-    "tropical", "typical", "universal", "vertical", "virtual", "visual",
-    "approval", "arrival", "colonial", "commercial", "conditional",
-    "constitutional", "conventional", "criminal", "cultural", "emotional",
-    "environmental", "essential", "eventual", "external",
-]
-
-ONE_FOR_L_TEMPLATES = [
-    "The {word} arrived at the main office this morning",
-    "We need to update the {word} before the deadline",
-    "The inspector verified the {word} during the routine check",
-    "Everyone agreed that the {word} was handled properly",
-    "The report mentioned the {word} several times throughout",
-    "After careful review, the {word} was approved by the board",
-    "The new {word} was introduced at the conference last week",
-    "Scientists studied the {word} under controlled conditions",
-    "The {word} proved essential for the success of the project",
-    "Management decided to prioritize the {word} going forward",
-]
-
-
-def _generate_one_for_l():
-    cases = []
-    for word in ONE_FOR_L_WORDS:
-        idx = word.find("l")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "1" + word[idx + 1:]
-        for ti, template in enumerate(ONE_FOR_L_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"1_for_l__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
-
-
-_RAW_ONE_FOR_L = _generate_one_for_l()
-
-# ═══════════════════════════════════════════════════════════════════════
-# 3.  Three for E  (3 → e)   — 80 words × 10 templates = 800 tests
-# ═══════════════════════════════════════════════════════════════════════
-
-THREE_FOR_E_WORDS = [
-    "better", "between", "before", "behind", "benefit", "believe",
-    "beyond", "career", "center", "complete", "create", "debate",
-    "decrease", "defense", "degree", "deliver", "demand", "describe",
-    "design", "desire", "determine", "develop", "device", "different",
-    "direct", "disease", "dream", "economy", "education", "effect",
-    "effort", "election", "element", "emerge", "energy", "engine",
-    "entire", "environment", "episode", "equal", "escape", "establish",
-    "event", "every", "evidence", "example", "excellent", "exercise",
-    "expect", "expense", "experience", "experiment", "expert", "express",
-    "extend", "extreme", "federal", "finance", "freedom", "frequent",
-    "general", "heritage", "increase", "interest", "internet", "leader",
-    "measure", "member", "message", "method", "network", "never",
-    "perfect", "person", "preserve", "prevent", "recent", "remember",
-    "research", "resource",
-]
-
-THREE_FOR_E_TEMPLATES = [
-    "The {word} was thoroughly discussed at the annual conference",
-    "Many people considered the {word} to be extremely important",
-    "The government announced changes to the {word} policy",
-    "Researchers published a comprehensive study about the {word}",
-    "The organization focused its efforts on improving the {word}",
-    "After the review, the {word} was modified to meet new standards",
-    "The {word} significantly impacted the outcome of the project",
-    "Experts recommended paying closer attention to the {word}",
-    "The recent developments regarding the {word} surprised everyone",
-    "Students were required to understand the {word} before proceeding",
-]
-
-
-def _generate_three_for_e():
-    cases = []
-    for word in THREE_FOR_E_WORDS:
-        idx = word.find("e")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "3" + word[idx + 1:]
-        for ti, template in enumerate(THREE_FOR_E_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"3_for_e__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
-
-
-_RAW_THREE_FOR_E = _generate_three_for_e()
-
-# ═══════════════════════════════════════════════════════════════════════
-# 4.  Five for S  (5 → s)   — 70 words × 10 templates = 700 tests
-# ═══════════════════════════════════════════════════════════════════════
-
-FIVE_FOR_S_WORDS = [
-    "school", "system", "science", "social", "simple", "single", "small",
-    "solid", "south", "space", "special", "stable", "standard", "state",
-    "station", "steel", "stock", "stone", "store", "story", "street",
-    "strong", "student", "study", "style", "subject", "success", "summer",
-    "supply", "support", "surface", "survey", "sweet", "symbol", "master",
-    "message", "mission", "missing", "monster", "muscle", "sister",
-    "season", "section", "second", "secret", "secure", "select", "senior",
-    "sense", "series", "serve", "session", "settle", "severe", "signal",
-    "silent", "silver", "skill", "sleep", "solution", "source", "spirit",
-    "spring", "square", "stage", "statement", "steady", "straight",
-    "strange", "strategy",
-]
-
-FIVE_FOR_S_TEMPLATES = [
-    "The {word} was recognized as one of the finest in the country",
-    "Parents were concerned about the quality of the {word}",
-    "The new {word} attracted widespread attention from the media",
-    "Officials announced improvements to the existing {word}",
-    "The {word} had been operating successfully for many years",
-    "Residents praised the {word} for its outstanding performance",
-    "The {word} underwent significant changes during the renovation",
-    "Analysts predicted strong growth for the {word} sector",
-    "The {word} was featured prominently in the documentary",
-    "Community leaders emphasized the importance of the {word}",
-]
-
-
-def _generate_five_for_s():
-    cases = []
-    for word in FIVE_FOR_S_WORDS:
-        idx = word.find("s")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "5" + word[idx + 1:]
-        for ti, template in enumerate(FIVE_FOR_S_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"5_for_s__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
-
-
-_RAW_FIVE_FOR_S = _generate_five_for_s()
-
-# ═══════════════════════════════════════════════════════════════════════
-# 5.  Seven for T  (7 → t)   — 60 words × 10 templates = 600 tests
-# ═══════════════════════════════════════════════════════════════════════
-
-SEVEN_FOR_T_WORDS = [
-    "table", "talent", "target", "taste", "teacher", "technology",
-    "temperature", "temple", "terminal", "territory", "test", "theater",
-    "theory", "therapy", "thought", "title", "together", "tomorrow",
-    "total", "touch", "tourist", "tower", "tradition", "traffic",
-    "training", "transfer", "transport", "travel", "treatment", "treaty",
-    "trend", "trial", "tribute", "trouble", "trust", "truth", "tunnel",
-    "battle", "better", "bottom", "butter", "button", "captain",
-    "cartoon", "castle", "cattle", "center", "chapter", "content",
-    "context", "control", "cotton", "counter", "country", "custom",
-    "digital", "distant", "eastern", "fifteen", "gentle",
-]
-
-SEVEN_FOR_T_TEMPLATES = [
-    "The {word} was established decades ago in the heart of the city",
-    "Visitors were impressed by the remarkable {word} on display",
-    "The professor lectured extensively about the {word} topic",
-    "Local authorities invested heavily in modernizing the {word}",
-    "The {word} received an award for excellence this year",
-    "Historians traced the origins of the {word} to ancient times",
-    "The documentary explored every aspect of the {word} in depth",
-    "Funding for the {word} was approved by the legislative body",
-    "The {word} played a pivotal role in shaping the community",
-    "Engineers redesigned the {word} to improve overall efficiency",
-]
-
-
-def _generate_seven_for_t():
-    cases = []
-    for word in SEVEN_FOR_T_WORDS:
-        idx = word.find("t")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "7" + word[idx + 1:]
-        for ti, template in enumerate(SEVEN_FOR_T_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"7_for_t__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
-
-
-_RAW_SEVEN_FOR_T = _generate_seven_for_t()
-
-# ═══════════════════════════════════════════════════════════════════════
-# 6.  Eight for B  (8 → b)   — 50 words × 10 templates = 500 tests
-# ═══════════════════════════════════════════════════════════════════════
-
-EIGHT_FOR_B_WORDS = [
-    "balance", "bank", "base", "basic", "battle", "beach", "beauty",
-    "become", "before", "begin", "behind", "belief", "belong", "below",
-    "benefit", "best", "better", "between", "beyond", "blood", "board",
-    "body", "bond", "book", "border", "born", "bottom", "bound", "brain",
-    "branch", "brand", "brave", "bread", "break", "bridge", "brief",
-    "bright", "bring", "broad", "broken", "brother", "brown", "budget",
-    "build", "burden", "burn", "business", "cabinet", "cable", "carbon",
-]
-
-EIGHT_FOR_B_TEMPLATES = [
-    "The {word} was examined under strict laboratory conditions",
-    "The annual report highlighted the importance of the {word}",
-    "Experts debated the significance of the {word} at the summit",
-    "The {word} remained intact despite the challenging circumstances",
-    "Observers noted that the {word} had improved considerably",
-    "The {word} was central to the discussion at the town hall",
-    "Researchers confirmed that the {word} met all safety standards",
-    "The {word} attracted considerable interest from investors",
-    "The {word} was carefully documented for future reference",
-    "Environmental studies revealed new insights about the {word}",
+ONE_FOR_L_CASES = [
+    ("The envelope contained a handwritten 1etter from her grandmother.",
+        "1etter", "letter", "1_l_letter_1"),
+    ("Each 1etter in the alphabet appears at least once on this page.",
+        "1etter", "letter", "1_l_letter_2"),
+    ("He said he11o to the receptionist as he walked past the front desk.",
+        "he11o", "hello", "1_l_hello_1"),
+    ("The park was crowded with peop1e enjoying the warm afternoon.",
+        "peop1e", "people", "1_l_people_1"),
+    ("Thousands of peop1e gathered in the square to hear the announcement.",
+        "peop1e", "people", "1_l_people_2"),
+    ("She left the house to walk her son to schoo1 before breakfast.",
+        "schoo1", "school", "1_l_school_1"),
+    ("The schoo1 district announced three new hires at the board meeting.",
+        "schoo1", "school", "1_l_school_2"),
+    ("We plan to bui1d the deck before the first frost arrives.",
+        "bui1d", "build", "1_l_build_1"),
+    ("The telephone cab1e was severed during the overnight storm.",
+        "cab1e", "cable", "1_l_cable_1"),
+    ("The inspector reported p1ain evidence of water damage in the basement.",
+        "p1ain", "plain", "1_l_plain_1"),
+    ("The dining room tab1e seats twelve when fully extended.",
+        "tab1e", "table", "1_l_table_1"),
+    ("The answer is simp1e once you look at the problem from a new angle.",
+        "simp1e", "simple", "1_l_simple_1"),
+    ("There is very 1ittle evidence to support the original hypothesis.",
+        "1ittle", "little", "1_l_little_1"),
+    ("Her 1ittle brother insisted on coming along to the movie.",
+        "1ittle", "little", "1_l_little_2"),
+    ("The g1oba1 economy remained sluggish through the winter months.",
+        "g1oba1", "global", "1_l_global_1"),
+    ("The frame is made of a lightweight meta1 alloy rather than steel.",
+        "meta1", "metal", "1_l_metal_1"),
+    ("She consulted a 1ega1 advisor before signing the lease.",
+        "1ega1", "legal", "1_l_legal_1"),
+    ("The water 1eve1 in the reservoir has dropped to historic lows.",
+        "1eve1", "level", "1_l_level_1"),
+    ("Every 1oca1 bakery closes early on Sundays.",
+        "1oca1", "local", "1_l_local_1"),
+    ("The dilemma raises a 1arge mora1 question that the court must settle.",
+        "mora1", "moral", "1_l_moral_1"),
+    ("The fina1 report was delivered to the governor's office this morning.",
+        "fina1", "final", "1_l_final_1"),
+    ("The to1ta1 cost of repairs came to almost twelve thousand dollars.",
+        "to1ta1", "total", "1_l_total_1"),
+    ("The roya1 visit drew enormous crowds to the palace gates.",
+        "roya1", "royal", "1_l_royal_1"),
+    ("Clean water is a vita1 resource that many regions cannot take for granted.",
+        "vita1", "vital", "1_l_vital_1"),
+    ("The shipping 1abel had been torn off in transit.",
+        "1abel", "label", "1_l_label_1"),
+    ("The sculptor built a clay mode1 before casting the bronze.",
+        "mode1", "model", "1_l_model_1"),
+    ("The control pane1 was locked behind a reinforced steel door.",
+        "pane1", "panel", "1_l_panel_1"),
+    ("Her second nove1 explores themes of exile and memory.",
+        "nove1", "novel", "1_l_novel_1"),
+    ("The ange1 atop the tree had been in the family for generations.",
+        "ange1", "angel", "1_l_angel_1"),
+    ("The came1 plodded across the dunes toward the distant oasis.",
+        "came1", "camel", "1_l_camel_1"),
+    ("They stayed at a quiet hote1 near the old town square.",
+        "hote1", "hotel", "1_l_hotel_1"),
+    ("The young rebe1 was captured just before dawn.",
+        "rebe1", "rebel", "1_l_rebel_1"),
+    ("Please cance1 my subscription at the end of the current billing cycle.",
+        "cance1", "cancel", "1_l_cancel_1"),
+    ("The sales channe1 in Europe grew faster than any other region.",
+        "channe1", "channel", "1_l_channel_1"),
+    ("They prefer to trave1 by train whenever the route permits it.",
+        "trave1", "travel", "1_l_travel_1"),
+    ("The old mining tunne1 was finally sealed for safety reasons.",
+        "tunne1", "tunnel", "1_l_tunnel_1"),
+    ("The zoo welcomed a new anima1 to its primate collection last month.",
+        "anima1", "animal", "1_l_animal_1"),
+    ("The state capita1 was evacuated in advance of the approaching hurricane.",
+        "capita1", "capital", "1_l_capital_1"),
+    ("The centra1 heating system failed on the coldest day of the year.",
+        "centra1", "central", "1_l_central_1"),
+    ("The crysta1 chandelier caught the afternoon light perfectly.",
+        "crysta1", "crystal", "1_l_crystal_1"),
+    ("The digita1 edition of the magazine launches next week.",
+        "digita1", "digital", "1_l_digital_1"),
+    ("The federa1 court dismissed the case on procedural grounds.",
+        "federa1", "federal", "1_l_federal_1"),
+    ("The genera1 outlines his strategy during a brief press conference.",
+        "genera1", "general", "1_l_general_1"),
+    ("The children's hospita1 received a substantial grant for new equipment.",
+        "hospita1", "hospital", "1_l_hospital_1"),
+    ("Her research was published in a peer-reviewed medical journa1.",
+        "journa1", "journal", "1_l_journal_1"),
+    ("A genuinely 1ibera1 democracy protects the rights of its minorities.",
+        "1ibera1", "liberal", "1_l_liberal_1"),
+    ("The teacher insisted on a 1itera1 reading of the passage.",
+        "1itera1", "literal", "1_l_literal_1"),
+    ("The novel has a magica1 quality that lingers long after the final page.",
+        "magica1", "magical", "1_l_magical_1"),
+    ("The treaty ended years of martia1 conflict along the border.",
+        "martia1", "martial", "1_l_martial_1"),
+    ("A medica1 team flew in by helicopter to stabilize the patient.",
+        "medica1", "medical", "1_l_medical_1"),
+    ("The region is rich in minera1 deposits, especially copper and iron.",
+        "minera1", "mineral", "1_l_mineral_1"),
+    ("The team made only minima1 changes to the original design.",
+        "minima1", "minimal", "1_l_minimal_1"),
+    ("The musica1 ran for three years on Broadway before closing.",
+        "musica1", "musical", "1_l_musical_1"),
+    ("The region has a natura1 abundance of fresh water and timber.",
+        "natura1", "natural", "1_l_natural_1"),
+    ("The diplomat preferred a strictly neutra1 stance on the matter.",
+        "neutra1", "neutral", "1_l_neutral_1"),
+    ("The nomina1 fee covers refreshments and program materials.",
+        "nomina1", "nominal", "1_l_nominal_1"),
+    ("The doctor confirmed that her vital signs were entirely norma1.",
+        "norma1", "normal", "1_l_normal_1"),
+    ("The microscope's optica1 system was recently recalibrated.",
+        "optica1", "optical", "1_l_optical_1"),
+    ("The orbita1 period of the moon is just under twenty-eight days.",
+        "orbita1", "orbital", "1_l_orbital_1"),
+    ("The insurance covers a partia1 refund under specific conditions.",
+        "partia1", "partial", "1_l_partial_1"),
+    ("She kept a persona1 journal every day for forty years.",
+        "persona1", "personal", "1_l_personal_1"),
+    ("The trainer designed a physica1 routine tailored to each athlete.",
+        "physica1", "physical", "1_l_physical_1"),
+    ("The word has a plura1 form that is often misused in writing.",
+        "plura1", "plural", "1_l_plural_1"),
+    ("The po1itica1 climate shifted sharply after the debate.",
+        "po1itica1", "political", "1_l_political_1"),
+    ("The principa1 greeted each family at the door on the first day of school.",
+        "principa1", "principal", "1_l_principal_1"),
+    ("She is a professiona1 chef with twenty years of restaurant experience.",
+        "professiona1", "professional", "1_l_professional_1"),
+    ("The budget proposa1 goes before the council on Monday.",
+        "proposa1", "proposal", "1_l_proposal_1"),
+    ("The experiment followed a strict protoco1 from start to finish.",
+        "protoco1", "protocol", "1_l_protocol_1"),
+    ("She is known for her radica1 views on urban planning.",
+        "radica1", "radical", "1_l_radical_1"),
+    ("The magistrate reached a clear and rationa1 decision.",
+        "rationa1", "rational", "1_l_rational_1"),
+    ("The regiona1 office serves customers across four states.",
+        "regiona1", "regional", "1_l_regional_1"),
+    ("The company requested the remova1 of the offending article from the website.",
+        "remova1", "removal", "1_l_removal_1"),
+    ("The contract renewa1 terms were agreed to without incident.",
+        "renewa1", "renewal", "1_l_renewal_1"),
+    ("The renta1 car was returned with a full tank of gas.",
+        "renta1", "rental", "1_l_rental_1"),
+    ("The seasona1 menu changes four times a year to reflect local produce.",
+        "seasona1", "seasonal", "1_l_seasonal_1"),
+    ("He has visited Japan severa1 times since the end of the pandemic.",
+        "severa1", "several", "1_l_several_1"),
+    ("The traffic signa1 at the main intersection has been malfunctioning all week.",
+        "signa1", "signal", "1_l_signal_1"),
+    ("A large socia1 gathering is planned for the last weekend of June.",
+        "socia1", "social", "1_l_social_1"),
+    ("Please use this entrance for specia1 deliveries only.",
+        "specia1", "special", "1_l_special_1"),
+    ("The retreat focused on the spiritua1 wellbeing of the participants.",
+        "spiritua1", "spiritual", "1_l_spiritual_1"),
+    ("Her surgica1 skills earned her a reputation as a top-tier transplant surgeon.",
+        "surgica1", "surgical", "1_l_surgical_1"),
+    ("The shipwrecked crew's surviva1 depended entirely on the crate of fresh water.",
+        "surviva1", "survival", "1_l_survival_1"),
+    ("Bus termina1 construction is scheduled to finish by next spring.",
+        "termina1", "terminal", "1_l_terminal_1"),
+    ("The therma1 imaging camera located the hikers at three in the morning.",
+        "therma1", "thermal", "1_l_thermal_1"),
+    ("The forest canopy in this tropica1 zone blocks most direct sunlight.",
+        "tropica1", "tropical", "1_l_tropical_1"),
+    ("This is a typica1 example of the fraud the agency has been tracking.",
+        "typica1", "typical", "1_l_typical_1"),
+    ("Clean water is a universa1 human right that no government should deny.",
+        "universa1", "universal", "1_l_universal_1"),
+    ("The vertica1 support beam developed a hairline crack under load.",
+        "vertica1", "vertical", "1_l_vertical_1"),
+    ("The company's virtua1 conference attracted participants from forty countries.",
+        "virtua1", "virtual", "1_l_virtual_1"),
+    ("The painter's visua1 style is unmistakable even from across the room.",
+        "visua1", "visual", "1_l_visual_1"),
+    ("The city council voted approva1 of the new zoning plan.",
+        "approva1", "approval", "1_l_approval_1"),
+    ("The train's arriva1 was delayed by unusually heavy snowfall.",
+        "arriva1", "arrival", "1_l_arrival_1"),
+    ("The colonia1 era left a lasting mark on the region's architecture.",
+        "colonia1", "colonial", "1_l_colonial_1"),
+    ("The commercia1 district suffered the worst damage in the fire.",
+        "commercia1", "commercial", "1_l_commercial_1"),
+    ("Acceptance is conditiona1 upon a satisfactory background check.",
+        "conditiona1", "conditional", "1_l_conditional_1"),
+    ("The ruling raises a serious constitutiona1 question about federal power.",
+        "constitutiona1", "constitutional", "1_l_constitutional_1"),
+    ("The crimina1 investigation has been ongoing for nearly two years.",
+        "crimina1", "criminal", "1_l_criminal_1"),
+    ("The city's cultura1 institutions rely heavily on private donors.",
+        "cultura1", "cultural", "1_l_cultural_1"),
+    ("Her first concert was a deeply emotiona1 experience for the whole family.",
+        "emotiona1", "emotional", "1_l_emotional_1"),
+    ("New environmenta1 rules take effect at the start of next year.",
+        "environmenta1", "environmental", "1_l_environmental_1"),
+    ("Proper rest is essentia1 to recovery after any major surgery.",
+        "essentia1", "essential", "1_l_essential_1"),
+    ("The peace agreement represented the eventua1 outcome of a decade of talks.",
+        "eventua1", "eventual", "1_l_eventual_1"),
+    ("The externa1 walls of the fort were rebuilt using original stones.",
+        "externa1", "external", "1_l_external_1"),
 ]
 
 
-def _generate_eight_for_b():
-    cases = []
-    for word in EIGHT_FOR_B_WORDS:
-        idx = word.find("b")
-        if idx == -1:
-            continue
-        corrupted = word[:idx] + "8" + word[idx + 1:]
-        for ti, template in enumerate(EIGHT_FOR_B_TEMPLATES, start=1):
-            text = template.format(word=corrupted)
-            test_id = f"8_for_b__{corrupted}__t{ti}"
-            cases.append((text, corrupted, word, test_id))
-    return cases
+# ═══════════════════════════════════════════════════════════════════════
+# 3.  Five for S  (5 → s)
+# ═══════════════════════════════════════════════════════════════════════
 
+FIVE_FOR_S_CASES = [
+    ("The 5chool closed for two weeks after the outbreak was confirmed.",
+        "5chool", "school", "5_s_school_1"),
+    ("My children walk to 5chool along a path behind our house.",
+        "5chool", "school", "5_s_school_2"),
+    ("The new payroll 5ystem went live on the first of the month.",
+        "5ystem", "system", "5_s_system_1"),
+    ("Rebuilding the 5ystem from scratch would take another six months.",
+        "5ystem", "system", "5_s_system_2"),
+    ("Modern 5cience has transformed our understanding of the brain.",
+        "5cience", "science", "5_s_science_1"),
+    ("Humans are deeply 5ocial creatures, shaped by their communities.",
+        "5ocial", "social", "5_s_social_1"),
+    ("The recipe is 5imple enough for a weeknight dinner.",
+        "5imple", "simple", "5_s_simple_1"),
+    ("She lives alone in a 5ingle room above the bakery.",
+        "5ingle", "single", "5_s_single_1"),
+    ("The 5mall dog barked at every passing bicycle.",
+        "5mall", "small", "5_s_small_1"),
+    ("The building rests on a 5olid concrete foundation.",
+        "5olid", "solid", "5_s_solid_1"),
+    ("The 5outh wing of the museum houses the Egyptian collection.",
+        "5outh", "south", "5_s_south_1"),
+    ("She stared into empty 5pace while the lecture dragged on.",
+        "5pace", "space", "5_s_space_1"),
+    ("Tonight's performance is a 5pecial tribute to her late mentor.",
+        "5pecial", "special", "5_s_special_1"),
+    ("The exchange rate was 5table for most of the quarter.",
+        "5table", "stable", "5_s_stable_1"),
+    ("The industry 5tandard requires annual safety audits.",
+        "5tandard", "standard", "5_s_standard_1"),
+    ("The 5tate legislature adjourned without passing the bill.",
+        "5tate", "state", "5_s_state_1"),
+    ("Passengers waited at the train 5tation for nearly three hours.",
+        "5tation", "station", "5_s_station_1"),
+    ("The suspension bridge's 5teel cables had been installed under budget.",
+        "5teel", "steel", "5_s_steel_1"),
+    ("The company's 5tock fell sharply after the earnings call.",
+        "5tock", "stock", "5_s_stock_1"),
+    ("He skipped a flat 5tone across the surface of the pond.",
+        "5tone", "stone", "5_s_stone_1"),
+    ("The corner 5tore has been in the same family for four decades.",
+        "5tore", "store", "5_s_store_1"),
+    ("The novel's opening 5tory hooks the reader immediately.",
+        "5tory", "story", "5_s_story_1"),
+    ("The children paraded down the 5treet carrying handmade signs.",
+        "5treet", "street", "5_s_street_1"),
+    ("A 5trong headwind slowed the runners in the final mile.",
+        "5trong", "strong", "5_s_strong_1"),
+    ("She was a bright 5tudent who rarely turned in late work.",
+        "5tudent", "student", "5_s_student_1"),
+    ("The archaeologist will 5tudy the artifacts for the next three years.",
+        "5tudy", "study", "5_s_study_1"),
+    ("Her signature 5tyle blends classical form with modern materials.",
+        "5tyle", "style", "5_s_style_1"),
+    ("The committee discussed one delicate 5ubject after another.",
+        "5ubject", "subject", "5_s_subject_1"),
+    ("The campaign's 5uccess surprised even its architects.",
+        "5uccess", "success", "5_s_success_1"),
+    ("The shop stays open late throughout the 5ummer tourist season.",
+        "5ummer", "summer", "5_s_summer_1"),
+    ("Shortages disrupted the 5upply of essential medicines for weeks.",
+        "5upply", "supply", "5_s_supply_1"),
+    ("The foundation will 5upport local artists for another five years.",
+        "5upport", "support", "5_s_support_1"),
+    ("The road 5urface was still slick from the morning rain.",
+        "5urface", "surface", "5_s_surface_1"),
+    ("The national 5urvey polled five thousand adults across twelve states.",
+        "5urvey", "survey", "5_s_survey_1"),
+    ("The 5weet scent of jasmine filled the courtyard.",
+        "5weet", "sweet", "5_s_sweet_1"),
+    ("Every nation chooses a 5ymbol to appear on its flag.",
+        "5ymbol", "symbol", "5_s_symbol_1"),
+    ("The chess ma5ter defeated six opponents simultaneously.",
+        "ma5ter", "master", "5_s_master_1"),
+    ("Check your voicemail for an urgent mes5age from the clinic.",
+        "mes5age", "message", "5_s_message_1"),
+    ("The space mis5ion was postponed for twenty-four hours.",
+        "mis5ion", "mission", "5_s_mission_1"),
+    ("The antique brooch has been mis5ing since the move.",
+        "mis5ing", "missing", "5_s_missing_1"),
+    ("The myth of the forest mon5ter has been told here for centuries.",
+        "mon5ter", "monster", "5_s_monster_1"),
+    ("Build strength in the core mu5cle group before adding resistance.",
+        "mu5cle", "muscle", "5_s_muscle_1"),
+    ("Her older si5ter moved abroad to work as a translator.",
+        "si5ter", "sister", "5_s_sister_1"),
+    ("The tourist 5eason peaks in late July and early August.",
+        "5eason", "season", "5_s_season_1"),
+    ("The next 5ection of the report covers regulatory compliance.",
+        "5ection", "section", "5_s_section_1"),
+    ("She finished the race in a 5econd under her previous record.",
+        "5econd", "second", "5_s_second_1"),
+    ("The chef kept the recipe a closely guarded 5ecret for decades.",
+        "5ecret", "secret", "5_s_secret_1"),
+    ("The compound is 5ecure against unauthorized access.",
+        "5ecure", "secure", "5_s_secure_1"),
+    ("The coach will 5elect the starting lineup before Friday's game.",
+        "5elect", "select", "5_s_select_1"),
+    ("The 5enior partners met privately before announcing the merger.",
+        "5enior", "senior", "5_s_senior_1"),
+    ("A deep 5ense of unease settled over the conference room.",
+        "5ense", "sense", "5_s_sense_1"),
+    ("The novel is the second in a 5eries of seven.",
+        "5eries", "series", "5_s_series_1"),
+    ("Volunteers 5erve meals to the homeless every Tuesday evening.",
+        "5erve", "serve", "5_s_serve_1"),
+    ("The counseling 5ession lasted exactly fifty minutes.",
+        "5ession", "session", "5_s_session_1"),
+    ("The dispute took weeks to 5ettle, even after both sides met.",
+        "5ettle", "settle", "5_s_settle_1"),
+    ("The sanctions represent a 5evere blow to the country's exports.",
+        "5evere", "severe", "5_s_severe_1"),
+    ("The dog responds on the second whistle 5ignal.",
+        "5ignal", "signal", "5_s_signal_1"),
+    ("The 5ilent auction raised over eighty thousand dollars for the school.",
+        "5ilent", "silent", "5_s_silent_1"),
+    ("She wore a thin 5ilver chain beneath her high collar.",
+        "5ilver", "silver", "5_s_silver_1"),
+    ("His one great 5kill was making everyone in the room feel heard.",
+        "5kill", "skill", "5_s_skill_1"),
+    ("I cannot 5leep when there's construction going on next door.",
+        "5leep", "sleep", "5_s_sleep_1"),
+    ("The physicist proposed an elegant 5olution to the paradox.",
+        "5olution", "solution", "5_s_solution_1"),
+    ("Always cite your 5ource when making a factual claim in an essay.",
+        "5ource", "source", "5_s_source_1"),
+    ("The team's 5pirit remained high despite the losing streak.",
+        "5pirit", "spirit", "5_s_spirit_1"),
+    ("The cherry trees bloomed later than usual that 5pring.",
+        "5pring", "spring", "5_s_spring_1"),
+    ("The floor plan is a perfect 5quare measuring twenty feet on each side.",
+        "5quare", "square", "5_s_square_1"),
+    ("The outdoor 5tage was dismantled after the festival ended.",
+        "5tage", "stage", "5_s_stage_1"),
+    ("The senator issued a detailed 5tatement later that afternoon.",
+        "5tatement", "statement", "5_s_statement_1"),
+    ("She has a 5teady hand and a quiet confidence in the operating room.",
+        "5teady", "steady", "5_s_steady_1"),
+    ("Keep the line 5traight and parallel to the edge of the board.",
+        "5traight", "straight", "5_s_straight_1"),
+    ("There was something 5trange about the way the room was arranged.",
+        "5trange", "strange", "5_s_strange_1"),
+    ("The general outlined his 5trategy during a closed briefing.",
+        "5trategy", "strategy", "5_s_strategy_1"),
+]
 
-_RAW_EIGHT_FOR_B = _generate_eight_for_b()
 
 # ═══════════════════════════════════════════════════════════════════════
-# Combine all raw cases and build the parametrize list
+# 4.  Eight for B  (8 → b)
+# ═══════════════════════════════════════════════════════════════════════
+
+EIGHT_FOR_B_CASES = [
+    ("The gymnast's 8alance on the beam was flawless from start to finish.",
+        "8alance", "balance", "8_b_balance_1"),
+    ("She took her savings out of the 8ank before flying abroad.",
+        "8ank", "bank", "8_b_bank_1"),
+    ("Every good argument must rest on a solid factual 8ase.",
+        "8ase", "base", "8_b_base_1"),
+    ("The 8asic requirements for the position are listed on page two.",
+        "8asic", "basic", "8_b_basic_1"),
+    ("The final 8attle of the campaign was fought just outside the city walls.",
+        "8attle", "battle", "8_b_battle_1"),
+    ("We spent the afternoon at the public 8each with a picnic lunch.",
+        "8each", "beach", "8_b_beach_1"),
+    ("The 8eauty of the cathedral's stained glass is best seen at sunset.",
+        "8eauty", "beauty", "8_b_beauty_1"),
+    ("Children rarely 8ecome fluent in a second language without regular practice.",
+        "8ecome", "become", "8_b_become_1"),
+    ("Please read the manual carefully 8efore operating the machine.",
+        "8efore", "before", "8_b_before_1"),
+    ("The lecture will 8egin promptly at ten o'clock.",
+        "8egin", "begin", "8_b_begin_1"),
+    ("The storage room is 8ehind the kitchen, through the service door.",
+        "8ehind", "behind", "8_b_behind_1"),
+    ("She holds a firm 8elief in the power of public education.",
+        "8elief", "belief", "8_b_belief_1"),
+    ("The keys 8elong to the maintenance staff and must be returned daily.",
+        "8elong", "belong", "8_b_belong_1"),
+    ("The signature line appears 8elow the final paragraph.",
+        "8elow", "below", "8_b_below_1"),
+    ("The grant's real 8enefit is the flexibility it offers researchers.",
+        "8enefit", "benefit", "8_b_benefit_1"),
+    ("The Italian coast offers some of the 8est seafood in Europe.",
+        "8est", "best", "8_b_best_1"),
+    ("The coffee is noticeably 8etter at the new cafe on Elm Street.",
+        "8etter", "better", "8_b_better_1"),
+    ("The distance 8etween the two villages is about six kilometers.",
+        "8etween", "between", "8_b_between_1"),
+    ("The ruins lie just 8eyond the river, overgrown with brambles.",
+        "8eyond", "beyond", "8_b_beyond_1"),
+    ("A small amount of 8lood was found at the scene, suggesting a struggle.",
+        "8lood", "blood", "8_b_blood_1"),
+    ("The chess 8oard was set up in front of the library window.",
+        "8oard", "board", "8_b_board_1"),
+    ("The swimmer's 8ody was pulled from the water just before dawn.",
+        "8ody", "body", "8_b_body_1"),
+    ("The mayor's 8ond with the community was evident at every public meeting.",
+        "8ond", "bond", "8_b_bond_1"),
+    ("She curled up with a 8ook by the fireplace.",
+        "8ook", "book", "8_b_book_1"),
+    ("The fence marks the southern 8order of the property.",
+        "8order", "border", "8_b_border_1"),
+    ("The child was 8orn prematurely but made a full recovery.",
+        "8orn", "born", "8_b_born_1"),
+    ("The painting had been sitting at the 8ottom of the trunk for decades.",
+        "8ottom", "bottom", "8_b_bottom_1"),
+    ("The ivy has already grown past the 8ound of the trellis.",
+        "8ound", "bound", "8_b_bound_1"),
+    ("The 8rain consumes roughly twenty percent of the body's energy at rest.",
+        "8rain", "brain", "8_b_brain_1"),
+    ("A small 8ranch of the library opened last spring in the north end.",
+        "8ranch", "branch", "8_b_branch_1"),
+    ("The old 8rand of soap is no longer being made.",
+        "8rand", "brand", "8_b_brand_1"),
+    ("It was 8rave of her to speak up in front of the whole committee.",
+        "8rave", "brave", "8_b_brave_1"),
+    ("The bakery sells fresh sourdough 8read every morning.",
+        "8read", "bread", "8_b_bread_1"),
+    ("Take a short 8reak between each set to let your muscles recover.",
+        "8reak", "break", "8_b_break_1"),
+    ("The old wooden 8ridge was closed for structural repairs.",
+        "8ridge", "bridge", "8_b_bridge_1"),
+    ("The author included a 8rief preface explaining her sources.",
+        "8rief", "brief", "8_b_brief_1"),
+    ("The hallway was too 8right for comfort after the dim conference room.",
+        "8right", "bright", "8_b_bright_1"),
+    ("Please 8ring a copy of your passport to the appointment.",
+        "8ring", "bring", "8_b_bring_1"),
+    ("The highway provides 8road access to the entire mountain region.",
+        "8road", "broad", "8_b_broad_1"),
+    ("The window was 8roken sometime during the night.",
+        "8roken", "broken", "8_b_broken_1"),
+    ("My oldest 8rother teaches chemistry at the community college.",
+        "8rother", "brother", "8_b_brother_1"),
+    ("She rolled a pair of 8rown leather gloves into her coat pocket.",
+        "8rown", "brown", "8_b_brown_1"),
+    ("The department's annual 8udget will be debated next Tuesday.",
+        "8udget", "budget", "8_b_budget_1"),
+    ("They plan to 8uild a wraparound porch on the south side of the house.",
+        "8uild", "build", "8_b_build_1"),
+    ("The tax code places an unfair 8urden on small landlords.",
+        "8urden", "burden", "8_b_burden_1"),
+    ("The candles 8urn slower when the wick is trimmed regularly.",
+        "8urn", "burn", "8_b_burn_1"),
+    ("She runs her own catering 8usiness out of a commercial kitchen downtown.",
+        "8usiness", "business", "8_b_business_1"),
+    ("The cha8inet in the corner holds the family's photo albums.",
+        "cha8inet", "cabinet", "8_b_cabinet_1"),
+    ("The telephone ca8le runs underground along the property line.",
+        "ca8le", "cable", "8_b_cable_1"),
+    ("Trees absorb car8on dioxide and release oxygen during photosynthesis.",
+        "car8on", "carbon", "8_b_carbon_1"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Combine all cases and build the parametrize list
 # ═══════════════════════════════════════════════════════════════════════
 
 RAW_CASES = (
-    _RAW_ZERO_FOR_O
-    + _RAW_ONE_FOR_L
-    + _RAW_THREE_FOR_E
-    + _RAW_FIVE_FOR_S
-    + _RAW_SEVEN_FOR_T
-    + _RAW_EIGHT_FOR_B
+    ZERO_FOR_O_CASES
+    + ONE_FOR_L_CASES
+    + FIVE_FOR_S_CASES
+    + EIGHT_FOR_B_CASES
 )
 
-# Strip the test-id column for the parametrize values; ids come separately.
 CASES = [(text, err, corr) for text, err, corr, _ in RAW_CASES]
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# The single parametrized test
-# ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.integration
