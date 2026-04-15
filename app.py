@@ -63,6 +63,7 @@ CONFUSIONS: dict[str, list[str]] = {
     "cl": ["d"],
     "|":  ["l", "I"],
     "rri":["m"],
+    "I":  ["l"],   # capital-I scanned for lowercase-l (faciIity → facility)
 }
 
 # UK→US spelling normalisation applied to model-generated corrections.
@@ -297,6 +298,11 @@ _DIGIT_IN_ALPHA = re.compile(r"[A-Za-z][0-9]|[0-9][A-Za-z]")
 _RN_DOUBLED     = re.compile(r"rn.*rn", re.IGNORECASE)
 _VV_IN_ALPHA    = re.compile(r"[A-Za-z]vv|vv[A-Za-z]")
 _PIPE_IN_ALPHA  = re.compile(r"[A-Za-z]\||\|[A-Za-z]")
+# Capital I appearing inside a lowercase alpha run (faciIity, additionaI, Iate).
+_CAP_I_IN_ALPHA = re.compile(r"[a-z]I|I[a-z]")
+# Word that contains zero alphabetic characters — pure digits/punctuation
+# like "16", "750", "--", "555-0140". Not OCR-checkable as a "word".
+_NO_ALPHA       = re.compile(r"^[^A-Za-z]+$")
 
 
 def _is_structurally_suspicious(word: str) -> bool:
@@ -305,6 +311,7 @@ def _is_structurally_suspicious(word: str) -> bool:
         or _RN_DOUBLED.search(word)
         or _VV_IN_ALPHA.search(word)
         or _PIPE_IN_ALPHA.search(word)
+        or _CAP_I_IN_ALPHA.search(word)
     )
 
 
@@ -422,6 +429,14 @@ def _ocr_check(text: str) -> CheckResponse:
     for m in re.finditer(r"\S+", text):
         word, ws, we = m.group(), m.start(), m.end()
         if len(word) < MIN_WORD_LEN:
+            continue
+
+        # Pure digits/punctuation (e.g. "16", "750", "--", "$50") aren't
+        # OCR-checkable as words — the only OCR-error case for them
+        # (digit-in-alpha) is already covered by the structural pattern,
+        # which requires alpha context. Skipping suppresses false positives
+        # on legitimate numbers, currency, dates, and punctuation runs.
+        if _NO_ALPHA.match(word):
             continue
 
         # Tokens overlapping this word
@@ -550,11 +565,18 @@ def _ocr_check(text: str) -> CheckResponse:
                 )
                 continue
 
-        suggestions = sorted(
-            [Suggestion(text=c, score=s)
-             for c, s in zip(cands, scores[1:]) if s >= 0.01],
-            key=lambda x: x.score, reverse=True,
+        # Build suggestions sorted by score. Always preserve the top-2
+        # candidates regardless of score so that a heavily-diluted top
+        # correction (e.g. "rebel" diluted across many sibling candidates
+        # for "rebe1") still surfaces. Below top-2, drop very low scores.
+        ranked = sorted(
+            zip(cands, scores[1:]), key=lambda cs: cs[1], reverse=True,
         )
+        suggestions = [
+            Suggestion(text=c, score=s)
+            for i, (c, s) in enumerate(ranked)
+            if i < 2 or s >= 0.01
+        ]
         if suggestions:
             spans.append(Span(
                 start=ws, end=we, text=word,
@@ -638,16 +660,20 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
     uncond_avg = uncond_sum / max(uncond_n, 1)
 
     # PMI score: does context help?
-    # Bias of 0.5 means weakly-positive PMI (unrelated but both fluent) scores < 0.5
+    # Bias of 0.2: even weakly-positive PMI suggests genuine continuation,
+    # since the abs_score below already filters gibberish. Earlier value of
+    # 0.5 was too punishing — well-formed mid-sentence and mid-word splits
+    # often have small but real PMI gains and should clear the 0.5 mark.
     pmi       = cond_avg - uncond_avg
-    pmi_score = 1.0 / (1.0 + math.exp(-(pmi - 0.5) * 3.0))
+    pmi_score = 1.0 / (1.0 + math.exp(-(pmi - 0.2) * 3.0))
 
     # Absolute score: is the conditional probability decent?
     # Good continuations: cond_avg ~ -1 to -4
     # Technical/unusual:   cond_avg ~ -4 to -6
     # Gibberish:           cond_avg ~ -7 to -10+
-    # Midpoint at -5 so technical text isn't over-penalised
-    abs_score = 1.0 / (1.0 + math.exp(-(cond_avg + 5.0) * 1.5))
+    # Midpoint at -5.5 (was -5.0) gives slightly more headroom for technical
+    # and proper-noun-heavy continuations whose conditional sits around -5.
+    abs_score = 1.0 / (1.0 + math.exp(-(cond_avg + 5.5) * 1.5))
 
     score = pmi_score * abs_score
 
