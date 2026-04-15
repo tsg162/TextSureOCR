@@ -90,6 +90,17 @@ _D_FOR_CL_MORPHEMES = (
     "de", "da", "du",   # prefix-ish: indude/declare/reduce
 )
 
+# Single-position (NOT replace-all) OCR substitutions. Each entry
+# generates one candidate per occurrence, so a word with two 'd's
+# yields two candidates per replacement, never a garbled replace-all.
+# Used for broad char-confusions that would explode candidate counts
+# under replace-all (d→c for cirdular→circular, d→l for vehicde→vehicle).
+POSITIONAL_CONFUSIONS: dict[str, list[str]] = {
+    "d": ["c", "l"],
+    "c": ["d"],
+    "l": ["d"],
+}
+
 log = logging.getLogger("textsure")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
@@ -299,6 +310,12 @@ _D_BETWEEN_VOWELS = re.compile(r"(?i)[a-z]+?[aeiou]d[aeiou]")
 # Word that contains zero alphabetic characters — pure digits/punctuation
 # like "16", "750", "--", "555-0140". Not OCR-checkable as a "word".
 _NO_ALPHA       = re.compile(r"^[^A-Za-z]+$")
+# Punctuation characters stripped from word-span boundaries so that
+# span.text / offsets cover the word itself, not trailing commas, periods,
+# quotes, parens, etc. Internal punctuation (hyphens/apostrophes in the
+# middle of "mother-in-law", "don't") is untouched because str.strip only
+# removes characters from the ends.
+_WORD_PUNCT = ".,;:!?\"'`()[]{}<>“”‘’…—–-"
 
 # Legitimate English words that contain "rn" — these should NOT trip
 # the single-rn structural flag. Generous to avoid false positives;
@@ -479,6 +496,17 @@ def _heuristic_candidates(word: str) -> list[str]:
             combined = combined.replace(key, rep)
     add(combined)
 
+    # Positional-only substitutions: one candidate per occurrence, never
+    # replace-all. Handles cirdular→circular (d@3→c), vehicde→vehicle
+    # (d@5→l) without polluting common words.
+    for key, replacements in POSITIONAL_CONFUSIONS.items():
+        spans = _occurrences(word, key)
+        if not spans:
+            continue
+        for rep in replacements:
+            for s, e in spans:
+                add(word[:s] + rep + word[e:])
+
     return out[:MAX_HEURISTIC_CANDIDATES]
 
 
@@ -577,7 +605,16 @@ def _ocr_check(text: str) -> CheckResponse:
     word_candidates: list[tuple[str, int, int, list[dict], list[dict], bool]] = []
 
     for m in re.finditer(r"\S+", text):
-        word, ws, we = m.group(), m.start(), m.end()
+        raw, rs, re_ = m.group(), m.start(), m.end()
+        # Strip leading/trailing punctuation so the span covers just the
+        # word itself — not trailing commas, periods, quotes, parens, etc.
+        lstrip = len(raw) - len(raw.lstrip(_WORD_PUNCT))
+        rstrip = len(raw) - len(raw.rstrip(_WORD_PUNCT))
+        ws = rs + lstrip
+        we = re_ - rstrip
+        if we <= ws:
+            continue
+        word = text[ws:we]
         if len(word) < MIN_WORD_LEN:
             continue
 
