@@ -6,7 +6,7 @@ See [SPECS.md](SPECS.md) for the API specification.
 
 ## Architecture
 
-**Model**: Qwen2.5-7B-Instruct (~14GB VRAM, FP16)
+**Model**: Qwen3-8B-Base (~16GB VRAM, BF16)
 
 **OCR error detection** (`POST /v1/ocr/check`):
 1. Forward-pass the text → per-token log-probabilities
@@ -14,7 +14,7 @@ See [SPECS.md](SPECS.md) for the API specification.
 3. Flag candidates from two sources:
    - **Heuristic**: digit↔letter mixtures (br0wn, H3llo, p0lice)
    - **Statistical**: words whose surprisal exceeds mean + 1.5σ (catches rn→m, garbled text)
-4. Generate correction suggestions via instruct-mode greedy decoding
+4. Build correction candidates from the model's top-k softmax predictions at suspicious positions, plus OCR-confusion heuristics
 5. Score [original, corrections] by full-text log-probability (softmax-normalised)
 6. False-positive filter: if original word scores highest, skip it
 
@@ -45,7 +45,7 @@ Environment variables (set in job YAML or .env):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TEXTSURE_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | HuggingFace model ID |
+| `TEXTSURE_MODEL` | `Qwen/Qwen3-8B-Base` | HuggingFace model ID |
 | `TEXTSURE_PORT` | `5002` | API listen port |
 | `TEXTSURE_SURPRISAL_Z` | `1.5` | Z-score threshold for surprisal outliers |
 | `TEXTSURE_SURPRISAL_FLOOR` | `8.0` | Minimum absolute surprisal threshold |

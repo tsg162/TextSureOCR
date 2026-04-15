@@ -1,13 +1,10 @@
 # How TextSureOCR Works
 
-TextSureOCR is a text forensics API that uses a language model (Qwen2.5-7B-Instruct) as a statistical judge. Instead of pattern-matching against a dictionary, it asks: "how surprised is the model by this word in context?" and "does knowing fragment A help predict fragment B?" All decisions come from token-level log-probabilities computed in forward passes — no fine-tuning, no external lookup tables.
+TextSureOCR is a text forensics API that uses a base language model (Qwen3-8B-Base) as a statistical judge. Instead of pattern-matching against a dictionary, it asks: "how surprised is the model by this word in context?" and "does knowing fragment A help predict fragment B?" All decisions come from token-level log-probabilities computed in forward passes — no fine-tuning, no external lookup tables, no instruction tuning (which would distort the natural next-token distribution).
 
 ## Model
 
-Qwen2.5-7B-Instruct loaded in FP16 on a single GPU (~14GB VRAM). All inference uses `temperature=0` (greedy decoding / deterministic scoring). The model is used in two modes:
-
-- **Scoring mode**: a single forward pass produces log-probabilities for every token position. This is the core primitive — cheap and fast (~40ms).
-- **Generation mode**: the instruct chat template + greedy decoding produces short correction suggestions (max 10 tokens). Only called for flagged words.
+Qwen3-8B-Base loaded in BF16 on a single GPU (~16GB VRAM). Inference is pure logit inspection on a single forward pass — no sampling, no generation, no chat templates. The model is used in one mode: read the softmax distribution at each position and reason over it.
 
 ## OCR Error Detection (`POST /v1/ocr/check`)
 
@@ -33,11 +30,10 @@ The threshold adapts to the text — technical or unusual writing raises the bas
 
 ### Phase 2: Verify and score corrections
 
-For each candidate word, the system generates correction suggestions from up to three sources:
+For each candidate word, the system generates correction suggestions from two sources:
 
-- **Systematic correction** (pattern candidates only): mechanically replace each digit with its OCR-confused letter (`br0wn` → `brown`)
-- **Instruct correction**: ask the model "what should this word be?" via the chat template
-- **Alternative correction** (surprisal candidates only): ask the model for a visually similar word that fits the context
+- **Softmax top-k correction**: at each suspicious token position, the forward-pass softmax distribution already has the model's preferred alternatives. Take the top-k token IDs, decode them, and splice them in at the suspicious position's character span (`_build_correction`). No generation, no prompting — just reading the distribution the model already produced.
+- **Systematic correction** (pattern candidates): mechanically apply the OCR-confusion map (`rn` → `m`, `vv` → `w`, digit↔letter, etc.) to produce alternative spellings
 
 Each unique correction is then scored against the original word using **full-text log-probability comparison**. For each candidate (original + corrections), the system:
 

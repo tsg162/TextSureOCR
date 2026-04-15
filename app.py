@@ -38,9 +38,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 AUTH_TOKEN       = os.getenv("TEXTSURE_AUTH_TOKEN", "")
 VAST_INSTANCE_ID = os.getenv("TEXTSURE_VAST_INSTANCE_ID", "")
-MODEL_ID         = os.getenv("TEXTSURE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+MODEL_ID         = os.getenv("TEXTSURE_MODEL", "Qwen/Qwen3-8B-Base")
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE            = torch.float16 if DEVICE == "cuda" else torch.float32
+# Qwen3 is trained in bf16; using fp16 on bf16 checkpoints can produce NaNs
+# in softmax tails, which matters for low-probability tokens (the exact regime
+# this app inspects). Stay in bf16 on CUDA.
+DTYPE            = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 
 TOKEN_PROB_FLOOR = float(os.getenv("TEXTSURE_TOKEN_PROB_FLOOR", "0.05"))
 MIN_LP_GAIN      = float(os.getenv("TEXTSURE_MIN_LP_GAIN", "4.0"))
@@ -65,17 +68,6 @@ CONFUSIONS: dict[str, list[str]] = {
     "rri":["m"],
     "I":  ["l"],   # capital-I scanned for lowercase-l (faciIity → facility)
 }
-
-# UK→US spelling normalisation applied to model-generated corrections.
-UK_US_SUFFIXES: list[tuple[str, str]] = [
-    ("our",  "or"),    # honour → honor, colour → color
-    ("ise",  "ize"),   # realise → realize
-    ("ised", "ized"),
-    ("ising","izing"),
-    ("yse",  "yze"),   # analyse → analyze
-    ("tre",  "ter"),   # centre → center
-    ("ogue", "og"),    # catalogue → catalog
-]
 
 log = logging.getLogger("textsure")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -254,37 +246,9 @@ def _build_correction(word: str, word_start: int, word_end: int,
     return result
 
 
-def _generate(prompt_text: str) -> str:
-    messages = [{"role": "user", "content": prompt_text}]
-    chat = lm.tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True,
-    )
-    ids = lm.tokenizer(chat, return_tensors="pt").input_ids.to(DEVICE)
-    with torch.no_grad():
-        out = lm.model.generate(ids, max_new_tokens=10, do_sample=False)
-    return lm.tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
-
-
 def _first_word(text: str) -> str:
     hit = re.search(r"[A-Za-z]+(?:[-'][A-Za-z]+)*", text)
     return hit.group().lower() if hit else ""
-
-
-def _ask_correction(text: str, word: str) -> str:
-    return _first_word(_generate(
-        f'The following OCR text contains a scanning error in the word "{word}". '
-        f'What should it correctly read? Reply with ONLY the single corrected '
-        f'word.\n\nText: "{text}"'
-    ))
-
-
-def _uk_to_us(word: str) -> str:
-    """Normalise common UK suffix spellings to US forms."""
-    wl = word.lower()
-    for uk, us in UK_US_SUFFIXES:
-        if wl.endswith(uk) and len(wl) > len(uk) + 1:
-            return word[:-len(uk)] + us
-    return word
 
 
 # ── Structural / character-confusion heuristics ────────────────────────
@@ -389,6 +353,52 @@ def _looks_like_common_word(word: str) -> bool:
     return bool(_COMMON_WORD_SHAPE.match(word.lower()))
 
 
+def _looks_like_code(word: str) -> bool:
+    """
+    Tracking numbers / SKUs / IDs: long mixed-alphanumeric strings with
+    many letter/digit transitions and several digits. These trip the
+    digit-in-alpha structural rule but are legitimate — the LM will
+    happily hallucinate "corrections" that are just different digit strings.
+
+    Must be distinguishable from single-digit-sub words like "c0mputer"
+    (len 8, 2 transitions, 1 digit) which *are* OCR errors we want to flag.
+    """
+    if len(word) < 10:
+        return False
+    digit_count = sum(c.isdigit() for c in word)
+    alpha_count = sum(c.isalpha() for c in word)
+    if digit_count < 3 or alpha_count < 1:
+        return False
+    transitions, prev = 0, None
+    for c in word:
+        kind = "a" if c.isalpha() else "d" if c.isdigit() else None
+        if kind is not None and prev is not None and kind != prev:
+            transitions += 1
+        if kind is not None:
+            prev = kind
+    return transitions >= 3
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Plain Levenshtein distance between two short strings."""
+    a, b = a.lower(), b.lower()
+    if a == b:
+        return 0
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(
+                prev[j] + 1,            # deletion
+                cur[j - 1] + 1,         # insertion
+                prev[j - 1] + (ca != cb),  # substitution
+            )
+        prev = cur
+    return prev[-1]
+
+
 # ── Candidate scoring (full-text log-prob comparison) ──────────────────
 
 def _score_candidates(
@@ -450,6 +460,13 @@ def _ocr_check(text: str) -> CheckResponse:
             if t["actual_prob"] < TOKEN_PROB_FLOOR
         ]
 
+        # Long alphanumeric codes (tracking numbers, SKUs, IDs) look
+        # structurally suspicious by the digit-in-alpha rule, but their
+        # letter/digit intermixing is legitimate. Suppress both the
+        # structural flag and any LM-based flagging for them.
+        if _looks_like_code(word):
+            continue
+
         structural = _is_structurally_suspicious(word)
 
         if not suspicious and not structural:
@@ -505,17 +522,6 @@ def _ocr_check(text: str) -> CheckResponse:
                 cands.append(c)
                 seen.add(cl)
 
-        # Instruct-generated correction (backup)
-        c_instruct = _ask_correction(text, word)
-        if c_instruct and c_instruct not in seen:
-            cands.append(c_instruct)
-            seen.add(c_instruct)
-            # Also try its US-normalised form so US-preference tests pass.
-            c_us = _uk_to_us(c_instruct)
-            if c_us and c_us.lower() not in seen:
-                cands.append(c_us)
-                seen.add(c_us.lower())
-
         if not cands:
             continue
 
@@ -525,6 +531,21 @@ def _ocr_check(text: str) -> CheckResponse:
             c for c in cands
             if SequenceMatcher(None, word.lower(), c.lower()).ratio() > SIMILARITY_FLOOR
         ]
+        # Shape filter — different rules for structural vs alpha-only words:
+        #   * Structural (digit-in-alpha, rn-doubling, etc.): an OCR error
+        #     shrinks "cornrnitrnent" (13) → "commitment" (10). Length and
+        #     edit distance can be large, so we only keep the ratio filter
+        #     above and add no further shape constraint here.
+        #   * Alpha-only (no structural marker): real OCR errors in pure-alpha
+        #     words overwhelmingly preserve length (1-char swap like teh↔the,
+        #     glyph flips like hlelo↔hello). Require same length AND edit
+        #     distance ≤ 2. This kills common-word paraphrases like
+        #     "for"→"from", "washed"→"was", "community"→"city".
+        if not structural:
+            cands = [
+                c for c in cands
+                if len(c) == len(word) and _edit_distance(word, c) <= 2
+            ]
         if not cands:
             log.info("  %s → no similar corrections, skipping", word)
             continue
@@ -554,10 +575,12 @@ def _ocr_check(text: str) -> CheckResponse:
             continue
         if not structural:
             # When the only signal is softmax probability and the surface form
-            # is a plausible English word, require a *much* larger gain to flag.
+            # is a plausible English word, require a much larger gain to flag.
+            # The stronger base model (Qwen3) produces 6-10 nat gains on
+            # natural paraphrase swaps, so we keep the bar high.
             gain_threshold = MIN_LP_GAIN
             if _looks_like_common_word(word):
-                gain_threshold = max(gain_threshold, 6.0)
+                gain_threshold = max(gain_threshold, 10.0)
             if improvement < gain_threshold:
                 log.info(
                     "  → false positive (improvement %.1f < %.1f)",

@@ -2465,12 +2465,12 @@ class TestConfigModelId:
     """MODEL_ID default value."""
 
     def test_default_model_id(self):
-        default = "Qwen/Qwen2.5-7B-Instruct"
+        default = "Qwen/Qwen3-8B-Base"
         assert "Qwen" in default
-        assert "7B" in default
+        assert "8B" in default
 
     def test_model_id_format(self):
-        default = "Qwen/Qwen2.5-7B-Instruct"
+        default = "Qwen/Qwen3-8B-Base"
         assert "/" in default
         parts = default.split("/")
         assert len(parts) == 2
