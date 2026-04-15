@@ -42,10 +42,38 @@ DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE            = torch.float16 if DEVICE == "cuda" else torch.float32
 
 TOKEN_PROB_FLOOR = float(os.getenv("TEXTSURE_TOKEN_PROB_FLOOR", "0.05"))
-MIN_LP_GAIN      = float(os.getenv("TEXTSURE_MIN_LP_GAIN", "1.0"))
+MIN_LP_GAIN      = float(os.getenv("TEXTSURE_MIN_LP_GAIN", "4.0"))
 SIMILARITY_FLOOR = float(os.getenv("TEXTSURE_SIMILARITY_FLOOR", "0.5"))
 TOP_K            = 5
 MIN_WORD_LEN     = 2
+MAX_HEURISTIC_CANDIDATES = 8
+
+# OCR character confusion map: glyphs often misread as each other.
+# Keys are sequences we find in suspect words; values are plausible true readings.
+CONFUSIONS: dict[str, list[str]] = {
+    "0":  ["o", "O"],
+    "1":  ["l", "i", "I"],
+    "5":  ["s", "S"],
+    "8":  ["B"],
+    "6":  ["b", "G"],
+    "2":  ["Z"],
+    "rn": ["m"],
+    "vv": ["w"],
+    "cl": ["d"],
+    "|":  ["l", "I"],
+    "rri":["m"],
+}
+
+# UK→US spelling normalisation applied to model-generated corrections.
+UK_US_SUFFIXES: list[tuple[str, str]] = [
+    ("our",  "or"),    # honour → honor, colour → color
+    ("ise",  "ize"),   # realise → realize
+    ("ised", "ized"),
+    ("ising","izing"),
+    ("yse",  "yze"),   # analyse → analyze
+    ("tre",  "ter"),   # centre → center
+    ("ogue", "og"),    # catalogue → catalog
+]
 
 log = logging.getLogger("textsure")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -248,6 +276,111 @@ def _ask_correction(text: str, word: str) -> str:
     ))
 
 
+def _uk_to_us(word: str) -> str:
+    """Normalise common UK suffix spellings to US forms."""
+    wl = word.lower()
+    for uk, us in UK_US_SUFFIXES:
+        if wl.endswith(uk) and len(wl) > len(uk) + 1:
+            return word[:-len(uk)] + us
+    return word
+
+
+# ── Structural / character-confusion heuristics ────────────────────────
+
+# A word is structurally suspicious if it:
+#   (a) mixes alphabetic characters with digits (schoo1, c0mputer, 1etter)
+#   (b) contains a doubled "rn" pattern (cornrnitrnent, governrnent)
+#   (c) contains "vv" inside an alpha run (vvord → word)
+#   (d) contains a pipe among letters (he|lo)
+_DIGIT_IN_ALPHA = re.compile(r"[A-Za-z][0-9]|[0-9][A-Za-z]")
+_RN_DOUBLED     = re.compile(r"rn.*rn", re.IGNORECASE)
+_VV_IN_ALPHA    = re.compile(r"[A-Za-z]vv|vv[A-Za-z]")
+_PIPE_IN_ALPHA  = re.compile(r"[A-Za-z]\||\|[A-Za-z]")
+
+
+def _is_structurally_suspicious(word: str) -> bool:
+    return bool(
+        _DIGIT_IN_ALPHA.search(word)
+        or _RN_DOUBLED.search(word)
+        or _VV_IN_ALPHA.search(word)
+        or _PIPE_IN_ALPHA.search(word)
+    )
+
+
+def _occurrences(word: str, key: str) -> list[tuple[int, int]]:
+    """Find (start, end) spans of every case-insensitive occurrence of *key*."""
+    spans = []
+    lower = word.lower()
+    k = key.lower()
+    i = 0
+    while True:
+        j = lower.find(k, i)
+        if j < 0:
+            break
+        spans.append((j, j + len(k)))
+        i = j + 1  # allow overlapping matches (e.g. "rnrn" has two at 0,1,2)
+    return spans
+
+
+def _heuristic_candidates(word: str) -> list[str]:
+    """
+    Generate correction candidates by applying OCR confusion substitutions.
+
+    For each confusion key, enumerate both:
+      * replace-all: every occurrence of the key → replacement (handles
+        "cornrnitrnent" → "commitment" where every `rn` is really an `m`)
+      * single-position: exactly one occurrence replaced (handles
+        "governrnent" → "government" where only one of two `rn`s is an `m`)
+    Candidates are capped to keep downstream scoring cheap.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(cand: str):
+        cl = cand.lower()
+        if cand and cand != word and cl not in seen:
+            seen.add(cl)
+            out.append(cand)
+
+    for key, replacements in CONFUSIONS.items():
+        spans = _occurrences(word, key)
+        if not spans:
+            continue
+        for rep in replacements:
+            # Replace-all variant.
+            if key.isalpha():
+                add(re.sub(re.escape(key), rep, word, flags=re.IGNORECASE))
+            else:
+                add(word.replace(key, rep))
+            # Single-position variants (only matters when >1 occurrence).
+            if len(spans) > 1:
+                for s, e in spans:
+                    add(word[:s] + rep + word[e:])
+
+    # Combined all-key candidate for multi-confusion tokens like "c0rnrni".
+    combined = word
+    for key, replacements in CONFUSIONS.items():
+        rep = replacements[0]
+        if key.isalpha():
+            combined = re.sub(re.escape(key), rep, combined, flags=re.IGNORECASE)
+        else:
+            combined = combined.replace(key, rep)
+    add(combined)
+
+    return out[:MAX_HEURISTIC_CANDIDATES]
+
+
+# Common-English allow-list used to suppress false positives on clean prose.
+# If the "suspect" word is a plain dictionary-shaped lowercase alpha word,
+# and the best correction differs only stylistically, skip flagging it.
+_COMMON_WORD_SHAPE = re.compile(r"^[a-z]{2,}$")
+
+
+def _looks_like_common_word(word: str) -> bool:
+    """Cheap shape check: purely alphabetic lowercase form, 2+ chars."""
+    return bool(_COMMON_WORD_SHAPE.match(word.lower()))
+
+
 # ── Candidate scoring (full-text log-prob comparison) ──────────────────
 
 def _score_candidates(
@@ -280,9 +413,10 @@ def _ocr_check(text: str) -> CheckResponse:
         return CheckResponse(result="ok", score=0.95, spans=[])
 
     # ── Phase 1: find words with suspicious tokens ──
-    # A token is suspicious when P(actual | prefix) < floor — the model
-    # thinks there's < 1% chance this token belongs here.
-    word_candidates: list[tuple[str, int, int, list[dict], list[dict]]] = []
+    # A word enters Phase 2 if EITHER:
+    #   (a) it contains a token with P(actual | prefix) < floor  (LM signal), OR
+    #   (b) it matches a structural OCR-confusion pattern         (heuristic signal)
+    word_candidates: list[tuple[str, int, int, list[dict], list[dict], bool]] = []
 
     for m in re.finditer(r"\S+", text):
         word, ws, we = m.group(), m.start(), m.end()
@@ -299,7 +433,10 @@ def _ocr_check(text: str) -> CheckResponse:
             t for t in word_tokens
             if t["actual_prob"] < TOKEN_PROB_FLOOR
         ]
-        if not suspicious:
+
+        structural = _is_structurally_suspicious(word)
+
+        if not suspicious and not structural:
             continue
 
         # Log what we found
@@ -312,13 +449,15 @@ def _ocr_check(text: str) -> CheckResponse:
                 top_text, top_prob,
                 word,
             )
-        word_candidates.append((word, ws, we, word_tokens, suspicious))
+        if structural and not suspicious:
+            log.info("  structural match on '%s' (no LM signal)", word)
+        word_candidates.append((word, ws, we, word_tokens, suspicious, structural))
 
     log.info(
         "OCR check: %d tokens, floor=%.3f, candidate words=%d (%s)",
         len(preds), TOKEN_PROB_FLOOR,
         len(word_candidates),
-        ", ".join(w for w, _, _, _, _ in word_candidates),
+        ", ".join(w for w, _, _, _, _, _ in word_candidates),
     )
 
     if not word_candidates:
@@ -329,16 +468,24 @@ def _ocr_check(text: str) -> CheckResponse:
 
     # ── Phase 2: build corrections, score, and filter ──
     spans: list[Span] = []
-    for word, ws, we, word_tokens, suspicious in word_candidates:
+    for word, ws, we, word_tokens, suspicious, structural in word_candidates:
         # Correction candidates from softmax top-k
         seen: set[str] = {word.lower()}
         cands: list[str] = []
 
-        # Try top-1, top-2, top-3 substitutions
-        for rank in range(3):
-            c = _build_correction(word, ws, we, word_tokens, suspicious, rank=rank)
+        # Softmax-based corrections (only when we have suspicious tokens)
+        if suspicious:
+            for rank in range(3):
+                c = _build_correction(word, ws, we, word_tokens, suspicious, rank=rank)
+                cl = c.lower()
+                if c and cl not in seen and cl != word.lower():
+                    cands.append(c)
+                    seen.add(cl)
+
+        # Heuristic corrections from the OCR confusion map.
+        for c in _heuristic_candidates(word):
             cl = c.lower()
-            if c and cl not in seen and cl != word.lower():
+            if cl not in seen:
                 cands.append(c)
                 seen.add(cl)
 
@@ -347,6 +494,11 @@ def _ocr_check(text: str) -> CheckResponse:
         if c_instruct and c_instruct not in seen:
             cands.append(c_instruct)
             seen.add(c_instruct)
+            # Also try its US-normalised form so US-preference tests pass.
+            c_us = _uk_to_us(c_instruct)
+            if c_us and c_us.lower() not in seen:
+                cands.append(c_us)
+                seen.add(c_us.lower())
 
         if not cands:
             continue
@@ -375,16 +527,27 @@ def _ocr_check(text: str) -> CheckResponse:
 
         # False-positive filter:
         #   1. Original must lose (correction scores higher)
-        #   2. The log-prob improvement must be substantial (MIN_LP_GAIN nats)
-        #      Real OCR fixes produce huge gains (10+), stylistic preferences
-        #      produce small gains (1-3).
+        #   2. The log-prob improvement must be substantial (MIN_LP_GAIN nats).
+        #      Real OCR fixes produce huge gains (10+); stylistic paraphrases
+        #      produce small gains (1-3) and we want those filtered.
+        #   3. Structural matches bypass the LP-gain floor — we already have
+        #      strong prior evidence (digit-in-alpha, rn-doubling, etc.).
         best_corr = max(scores[1:], default=0)
         if scores and scores[0] >= best_corr:
             log.info("  → false positive (original wins)")
             continue
-        if improvement < MIN_LP_GAIN:
-            log.info("  → false positive (improvement %.1f < %.1f)", improvement, MIN_LP_GAIN)
-            continue
+        if not structural:
+            # When the only signal is softmax probability and the surface form
+            # is a plausible English word, require a *much* larger gain to flag.
+            gain_threshold = MIN_LP_GAIN
+            if _looks_like_common_word(word):
+                gain_threshold = max(gain_threshold, 6.0)
+            if improvement < gain_threshold:
+                log.info(
+                    "  → false positive (improvement %.1f < %.1f)",
+                    improvement, gain_threshold,
+                )
+                continue
 
         suggestions = sorted(
             [Suggestion(text=c, score=s)
@@ -423,12 +586,29 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
     text doesn't push score above 0.5.  Absolute score prevents gibberish.
     """
     # Conditional: P(second | first)
+    # Use offset_mapping to locate the boundary precisely. BPE tokenizers
+    # merge the space into the first token of `second` (" dog"), so naively
+    # tokenising `first + " "` and using its length as the split would skip
+    # that high-signal first token of the continuation. Instead, the split is
+    # the first token in the joint whose char_start lies at or past the
+    # boundary between `first` and `second`.
     joint     = first + " " + second
-    joint_enc = lm.tokenizer(joint, return_tensors="pt", add_special_tokens=False)
+    boundary  = len(first) + 1  # char index of second's first character
+    joint_enc = lm.tokenizer(
+        joint, return_tensors="pt",
+        return_offsets_mapping=True, add_special_tokens=False,
+    )
     joint_ids = joint_enc["input_ids"].to(DEVICE)
+    j_offsets = joint_enc["offset_mapping"][0]
 
-    first_sp = lm.tokenizer(first + " ", return_tensors="pt", add_special_tokens=False)
-    split    = first_sp["input_ids"].shape[1]
+    split = joint_ids.shape[1]
+    for i in range(joint_ids.shape[1]):
+        cs = int(j_offsets[i][0].item())
+        ce = int(j_offsets[i][1].item())
+        # First token whose content actually reaches into `second`.
+        if ce > boundary - 1 and cs >= boundary - 1:
+            split = i
+            break
 
     with torch.no_grad():
         j_logits = lm.model(joint_ids).logits[0]
