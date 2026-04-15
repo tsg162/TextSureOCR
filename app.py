@@ -52,6 +52,12 @@ TOP_K            = 5
 MIN_WORD_LEN     = 2
 MAX_HEURISTIC_CANDIDATES = 14
 
+# Debug mode: set via env var or query param for detailed diagnostics
+DEBUG_MODE       = os.getenv("TEXTSURE_DEBUG", "").lower() in ("1", "true", "yes")
+
+# Branch-and-explore: proactively try OCR corrections on all words
+BRANCH_EXPLORE   = os.getenv("TEXTSURE_BRANCH_EXPLORE", "").lower() in ("1", "true", "yes")
+
 # OCR character confusion map: glyphs often misread as each other.
 # Keys are sequences we find in suspect words; values are plausible true readings.
 CONFUSIONS: dict[str, list[str]] = {
@@ -70,11 +76,11 @@ CONFUSIONS: dict[str, list[str]] = {
     "cl": ["d"],
     "d":  ["cl"],
     "|":  ["l", "I"],
-    "rri":["m"],
-    "I":  ["l"],   # capital-I scanned for lowercase-l (faciIity → facility)
-    # ── rrn: doubled-r artifact when m→rn adjacent to an r ──
-    # (burrn→burn, harrn→harm, confrrn→confirm, storrn→storm)
-    "rrn": ["rn", "rm"],
+    # ── rrn: doubled-r artifact when m→rn occurs after an existing r ──
+    # Words ending in -rm (alarm, form, storm, warm, etc.): the "m" is
+    # OCR'd as "rn", and the preceding "r" gives "r"+"rn" = "rrn".
+    # Fix: "rrn" → "rm"  (alarrn→alarm, storrn→storm, forrn→form).
+    "rrn": ["rm"],
     # ── fi-ligature garble: fi scans as ft or fm ──
     # (ftre→fire, fmd→find, ftnal→final). Some cases need length-
     # changing substitutions (fmd→find: 3→4 chars, "m" → "in").
@@ -120,19 +126,113 @@ class Span(BaseModel):
 
 class CheckRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10_000)
+    debug: bool = False  # Enable detailed diagnostics in response
+
+class TokenDebug(BaseModel):
+    text: str                                          # The actual text at this position
+    token_id: int = 0                                  # Model's token ID
+    char_start: int
+    char_end: int
+    actual_prob: float                                 # P(actual | prefix)
+    actual_log_prob: float = 0.0                       # log P
+    top_predictions: list[tuple[str, float, int]] = [] # (text, prob, token_id)
+    is_suspicious: bool = False                        # Below TOKEN_PROB_FLOOR
+    word_context: str | None = None                    # Which word this token belongs to
+
+
+class WordDebug(BaseModel):
+    word: str
+    start: int
+    end: int
+    # Tokenization info
+    tokenization: list[str] = []                       # How this word tokenizes ["▁dis", "dose"]
+    token_ids: list[int] = []                          # Corresponding token IDs
+    token_probs: list[float] = []                      # Per-token probabilities
+    word_surprisal: float = 0.0                        # Mean negative log-prob
+
+    # Detection info
+    suspicious_tokens: list[int] = []                  # Indices of low-prob tokens
+    structural_match: bool = False
+    structural_reasons: list[str] = []                 # ["d_in_word", "rn_pattern", etc.]
+    branch_explore: bool = False                       # Included via BRANCH_EXPLORE mode
+
+    # Candidate generation
+    softmax_candidates: list[str] = []                 # From top-k at suspicious positions
+    heuristic_candidates: list[str] = []               # From confusion map
+    candidates_pre_filter: list[str] = []              # Before similarity/shape filter
+    candidates_post_filter: list[str] = []             # After filtering
+
+    # Scoring
+    scores: dict[str, float] = {}                      # {candidate: softmax_score}
+    raw_log_probs: dict[str, float] = {}               # {candidate: total_log_prob}
+    improvement: float = 0.0                           # best_correction_lp - original_lp
+
+    # Decision
+    outcome: str = ""                                  # "flagged", "fp_original_wins", etc.
+    outcome_reason: str = ""                           # Human-readable explanation
+
+    # Legacy compatibility
+    tokens: list[TokenDebug] = []
+    candidates_generated: list[str] = []
+    candidates_after_filter: list[str] = []
+
+
+class BranchExploreResult(BaseModel):
+    word: str
+    start: int
+    end: int
+    original_tokenization: list[str] = []
+    original_log_prob: float = 0.0
+    corrections_tried: list[dict] = []                 # Each correction attempt
+
+
+class DebugInfo(BaseModel):
+    all_tokens: list[TokenDebug] = []
+    words_analyzed: list[WordDebug] = []
+    branch_explore_results: list[BranchExploreResult] = []
 
 class CheckResponse(BaseModel):
     result: str
     score: float
     spans: list[Span] = []
+    debug: DebugInfo | None = None
 
 class ContinuationRequest(BaseModel):
     first: str  = Field(..., min_length=1, max_length=5_000)
     second: str = Field(..., min_length=1, max_length=5_000)
+    debug: bool = False
+
+
+class ContinuationDebug(BaseModel):
+    # Tokenization
+    first_tokens: list[str] = []
+    second_tokens: list[str] = []
+    joint_tokens: list[str] = []                       # first + " " + second
+    boundary_token_idx: int = 0                        # Where second starts in joint
+
+    # Conditional scoring
+    conditional_token_probs: list[float] = []          # P(second_token_i | first + preceding)
+    conditional_avg_log_prob: float = 0.0
+
+    # Unconditional scoring
+    unconditional_token_probs: list[float] = []        # P(second_token_i | preceding_only)
+    unconditional_avg_log_prob: float = 0.0
+
+    # PMI calculation
+    pmi: float = 0.0                                   # conditional - unconditional
+    pmi_score: float = 0.0                             # sigmoid((PMI - 0.5) * 3)
+    abs_score: float = 0.0                             # sigmoid((cond_avg + 5) * 1.5)
+    final_score: float = 0.0                           # pmi_score * abs_score
+
+    # Decision
+    threshold: float = 0.5
+    verdict: str = ""                                  # "likely_continuation" or "unlikely"
+
 
 class ContinuationResponse(BaseModel):
     result: str
     score: float
+    debug: ContinuationDebug | None = None
 
 
 # ── Model manager ──────────────────────────────────────────────────────
@@ -182,7 +282,9 @@ def _token_predictions(text: str) -> list[dict]:
     Single forward pass.  For each token position i > 0, returns:
       - char_start, char_end  (character offsets in the original text)
       - actual_text           (the characters at that position)
+      - actual_id             (token ID of the actual token)
       - actual_prob           (P(actual_token_i | tokens_0..i-1))
+      - actual_log_prob       (log P(actual_token_i | tokens_0..i-1))
       - top_preds             (top-K alternative tokens as [(token_id, prob), ...])
 
     This is the core primitive: the model sees tokens 0..i-1 and tells us
@@ -199,11 +301,13 @@ def _token_predictions(text: str) -> list[dict]:
     with torch.no_grad():
         logits = lm.model(ids).logits[0]
     probs = F.softmax(logits, dim=-1)
+    log_probs = F.log_softmax(logits, dim=-1)
 
     out: list[dict] = []
     for i in range(1, ids.shape[1]):
         actual_id   = ids[0, i].item()
         actual_prob = probs[i - 1, actual_id].item()
+        actual_log_prob = log_probs[i - 1, actual_id].item()
         top_vals, top_ids = probs[i - 1].topk(TOP_K)
         cs = int(offsets[i][0].item())
         ce = int(offsets[i][1].item())
@@ -211,7 +315,9 @@ def _token_predictions(text: str) -> list[dict]:
             "char_start":  cs,
             "char_end":    ce,
             "actual_text": text[cs:ce],
+            "actual_id":   actual_id,
             "actual_prob": actual_prob,
+            "actual_log_prob": actual_log_prob,
             "top_preds":   [(top_ids[j].item(), top_vals[j].item()) for j in range(TOP_K)],
         })
     return out
@@ -291,22 +397,19 @@ def _first_word(text: str) -> str:
 #       (governrnent, hurnan, rnedical — catches single and doubled rn)
 #   (c) contains "vv" inside an alpha run (vvord → word)
 #   (d) contains a pipe among letters (he|lo)
-#   (e) capital I next to lowercase (faciIity, additionaI)
-#   (f) word-initial "ft" or "fm" followed by alpha — fi-ligature garble
-#   (g) "rrn" or "rrm" — doubled-r m-substitution artifact
-#   (h) "d" between vowels inside a non-dictionary shape — cl→d OCR
+#   (e) word-initial "ft" or "fm" followed by alpha — fi-ligature garble
+#   (f) "rrn" or "rrm" — doubled-r m-substitution artifact
+#   (g) "d" between vowels inside a non-dictionary shape — cl→d OCR
 _DIGIT_IN_ALPHA = re.compile(r"[A-Za-z][0-9]|[0-9][A-Za-z]")
-_RN_IN_ALPHA    = re.compile(r"[A-Za-z]rn[A-Za-z]", re.IGNORECASE)
+_RN_IN_ALPHA    = re.compile(r"(?:^|[A-Za-z])rn(?:$|[A-Za-z])", re.IGNORECASE)
 _VV_IN_ALPHA    = re.compile(r"[A-Za-z]vv|vv[A-Za-z]")
 _PIPE_IN_ALPHA  = re.compile(r"[A-Za-z]\||\|[A-Za-z]")
-_CAP_I_IN_ALPHA = re.compile(r"[a-z]I|I[a-z]")
 _FI_GARBLE      = re.compile(r"^f[tm][a-z]|[a-z]f[tm][a-z]", re.IGNORECASE)
 _RRN_DOUBLED    = re.compile(r"rr[nm]", re.IGNORECASE)
-# "d" sandwiched between vowels (indude, dedare, exdude, prodaim).
-# Real English "-ede-/-ade-/-ode-/-ude-/-ide-" patterns (made, side, wide,
-# ride, hide, blade, spade, node, code, dude) are common, so we only
-# mark this structural when the word doesn't exist in the safe list.
-_D_BETWEEN_VOWELS = re.compile(r"(?i)[a-z]+?[aeiou]d[aeiou]")
+# Any "d" in word could be OCR'd "cl". We filter false positives via
+# the safe-word list and let log-prob scoring do the final decision.
+# Old approach required d between vowels - too restrictive (missed "disdose").
+_D_IN_WORD = re.compile(r"[a-zA-Z]d|d[a-zA-Z]")
 # Word that contains zero alphabetic characters — pure digits/punctuation
 # like "16", "750", "--", "555-0140". Not OCR-checkable as a "word".
 _NO_ALPHA       = re.compile(r"^[^A-Za-z]+$")
@@ -371,39 +474,91 @@ _RN_SAFE_WORDS = frozenset({
     "marney", "barney", "journey",
 })
 
-# Words containing "d" between vowels that are legitimate English.
-# Used to gate the cl→d structural rule. Generous allow-list; bogus
-# candidates past this point are filtered by log-prob gain.
-_D_VOWEL_SAFE_WORDS = frozenset({
+# Common English words with "d" that should NOT trigger cl→d detection.
+# This is a large list because we now flag ANY word with "d" adjacent to
+# letters. The log-prob scoring does final filtering, but this list
+# prevents expensive scoring passes on obviously-correct common words.
+_D_SAFE_WORDS = frozenset({
+    # -ade words
     "made", "fade", "wade", "blade", "glade", "grade", "trade", "shade",
-    "spade", "upgrade", "degrade", "upgrade", "cascade", "decade",
+    "spade", "upgrade", "degrade", "cascade", "decade", "arcade",
     "parade", "crusade", "invade", "evade", "pervade", "brigade",
-    "handmade", "homemade", "lemonade", "promenade",
+    "handmade", "homemade", "lemonade", "promenade", "blockade",
+    # -ide words
     "side", "ride", "hide", "tide", "wide", "bride", "pride", "slide",
-    "glide", "stride", "provide", "divide", "beside", "decide",
+    "glide", "stride", "provide", "divide", "beside", "decide", "guide",
     "outside", "inside", "upside", "aside", "reside", "subside",
-    "collide", "abide", "preside", "override", "landslide",
+    "collide", "abide", "preside", "override", "landslide", "worldwide",
+    # -ode words
     "node", "code", "mode", "rode", "erode", "bode", "abode", "episode",
-    "explode", "corrode", "anode", "diode", "methodology",
+    "explode", "corrode", "anode", "diode", "methodology", "encode", "decode",
+    # -ude words
     "dude", "rude", "crude", "etude", "nude", "allude", "elude",
     "exclude", "include", "preclude", "conclude", "delude", "extrude",
-    "seclude", "intrude", "magnitude", "attitude", "altitude",
-    "ado", "dado",
-    "adobe", "adopt", "adore",
-    "medal", "metal", "modem",
-    "today", "today", "idea", "ideal", "ideally", "ideas",
-    "audio", "radio", "radios", "radius", "media", "medium",
-    "video", "videos", "codec", "model", "models",
-    "body", "lady", "shady", "windy", "study", "studies", "studied",
-    "ready", "already", "steady", "sturdy", "heady", "heady",
-    "video", "edit", "edits", "edited", "editor",
-    "udon", "udder", "idol", "idols", "idolize",
-    "adequate", "adequately", "adequacy",
-    "identify", "identical", "ideology",
-    "adobe", "odor", "odors", "odorous",
-    "under", "underneath", "udp",
-    "academic", "academy", "academies",
-    "advocacy", "adobe",
+    "seclude", "intrude", "magnitude", "attitude", "altitude", "latitude",
+    # Very common words with d
+    "and", "said", "had", "would", "could", "should", "did", "good", "bad",
+    "old", "new", "end", "find", "found", "hand", "hands", "kind", "mind",
+    "need", "needed", "used", "called", "world", "word", "words", "made",
+    "day", "days", "today", "yesterday", "red", "bed", "head", "read",
+    "dead", "lead", "bread", "spread", "thread", "instead", "ahead",
+    "add", "added", "odd", "sudden", "hidden", "forbidden", "middle",
+    "children", "garden", "modern", "golden", "wooden", "sudden",
+    "hundred", "considered", "indeed", "understand", "understood",
+    "riend", "friend", "friends", "send", "spend", "depend", "extend",
+    "defend", "offend", "suspend", "recommend", "trend", "blend",
+    "second", "beyond", "around", "ground", "sound", "found", "round",
+    "bound", "pound", "wound", "background", "underground",
+    "standard", "understand", "demand", "command", "expand", "brand",
+    "grand", "hand", "land", "band", "sand", "stand", "island",
+    "wind", "kind", "mind", "find", "behind", "remind", "blind",
+    "hold", "told", "cold", "gold", "bold", "sold", "fold", "old",
+    "field", "build", "child", "wild", "mild", "guild", "yield",
+    "board", "record", "toward", "forward", "reward", "word", "lord",
+    "order", "ordered", "border", "disorder", "record", "accord",
+    "food", "good", "mood", "wood", "hood", "flood", "blood", "stood",
+    "road", "load", "broad", "abroad", "download", "upload",
+    "head", "dead", "read", "lead", "bread", "spread", "thread",
+    "instead", "ahead", "widespread",
+    "bed", "red", "fed", "led", "shed", "sped", "wed", "fled", "bred",
+    "speed", "need", "feed", "seed", "deed", "breed", "proceed", "exceed",
+    "succeed", "indeed",
+    "add", "odd", "added", "adding", "addition", "additional", "address",
+    "middle", "muddle", "puddle", "riddle", "saddle", "paddle", "meddle",
+    "sudden", "hidden", "forbidden", "ridden", "madden", "gladden",
+    "garden", "burden", "warden", "harden", "pardon",
+    "modern", "golden", "wooden", "olden", "embolden",
+    "children", "brethren",
+    "under", "wonder", "thunder", "blunder", "plunder", "asunder",
+    "hundred", "kindred",
+    "idea", "ideal", "ideas", "ideally", "identity", "identify",
+    "identical", "ideology",
+    "media", "medium", "audio", "radio", "video", "studio",
+    "body", "nobody", "everybody", "somebody", "anybody",
+    "lady", "study", "studied", "studies", "studying", "ready", "already",
+    "steady", "unsteady", "heady", "shady", "windy", "cloudy", "muddy",
+    "edit", "edits", "edited", "editing", "editor", "edition", "editorial",
+    "credit", "credits", "audit", "reddit",
+    "model", "models", "modem", "modest", "modify", "modified",
+    "adopt", "adopted", "adoption", "adapt", "adapted", "adaptation",
+    "adult", "adults", "adequate", "adequately", "inadequate",
+    "advice", "advise", "advised", "advisor", "advocate", "advocacy",
+    "advance", "advanced", "advancement", "advantage", "adventure",
+    "advertise", "advertisement", "advertised",
+    "education", "educational", "educator", "educate", "educated",
+    "individual", "individuals", "individually",
+    "industry", "industrial", "industries",
+    "product", "products", "production", "produce", "produced", "producer",
+    "period", "periods", "periodic", "periodically",
+    "method", "methods", "methodology",
+    "president", "presidential", "resident", "residential",
+    "student", "students", "accident", "accidental", "incident",
+    "evidence", "evident", "evidently", "provide", "provided", "provider",
+    "decide", "decided", "decision", "dividend",
+    "consider", "considered", "consideration",
+    "understand", "understood", "understanding", "misunderstand",
+    "during", "procedure", "procedures",
+    "ود", "údržba",  # non-English but might appear
 })
 
 
@@ -415,25 +570,31 @@ def _core_word(word: str) -> str:
     return _STRIP_PUNCT.sub("", word).lower()
 
 
-def _is_structurally_suspicious(word: str) -> bool:
+def _get_structural_reasons(word: str) -> list[str]:
+    """Return list of all structural patterns matched by this word."""
+    reasons = []
     w = _core_word(word)
-    if _DIGIT_IN_ALPHA.search(word): return True
-    if _VV_IN_ALPHA.search(word):    return True
-    if _PIPE_IN_ALPHA.search(word):  return True
-    if _CAP_I_IN_ALPHA.search(word): return True
-    if _RRN_DOUBLED.search(word):    return True
-    if _FI_GARBLE.search(word):      return True
-    # Single-rn rule: flag any mid-word "rn" unless the word is in the
-    # English "-rn" allow-list. The allow-list is exact (not a prefix
-    # match) so "governrnent" still gets flagged even though it shares
-    # a prefix with "government".
+
+    if _DIGIT_IN_ALPHA.search(word):
+        reasons.append("digit_in_alpha")
+    if _VV_IN_ALPHA.search(word):
+        reasons.append("vv_pattern")
+    if _PIPE_IN_ALPHA.search(word):
+        reasons.append("pipe_in_alpha")
+    if _RRN_DOUBLED.search(word):
+        reasons.append("rrn_doubled")
+    if _FI_GARBLE.search(word):
+        reasons.append("fi_garble")
     if _RN_IN_ALPHA.search(word) and w not in _RN_SAFE_WORDS:
-        return True
-    # cl→d rule: "d" sandwiched between vowels in a word that isn't
-    # common English. Exact-word check only — no prefix matching.
-    if _D_BETWEEN_VOWELS.search(word) and w not in _D_VOWEL_SAFE_WORDS:
-        return True
-    return False
+        reasons.append("rn_pattern")
+    if _D_IN_WORD.search(word) and w not in _D_SAFE_WORDS:
+        reasons.append("d_in_word")
+
+    return reasons
+
+
+def _is_structurally_suspicious(word: str) -> bool:
+    return len(_get_structural_reasons(word)) > 0
 
 
 def _occurrences(word: str, key: str) -> list[tuple[int, int]]:
@@ -591,17 +752,103 @@ def _score_candidates(
     return [round(e / s, 3) for e in exps], raw
 
 
+# ── Branch-and-explore: try OCR corrections proactively ───────────────
+
+def _branch_explore_word(
+    text: str, word: str, ws: int, we: int
+) -> tuple[float, str | None, list[tuple[str, float]]]:
+    """
+    Try all OCR correction candidates for a word and score them.
+
+    Returns:
+        (improvement, best_candidate, all_scored)
+        - improvement: log-prob gain of best correction over original (nats)
+        - best_candidate: the correction with highest score, or None
+        - all_scored: list of (candidate, raw_log_prob) for debugging
+    """
+    # Generate candidates from confusion map
+    cands = _heuristic_candidates(word)
+    if not cands:
+        return 0.0, None, []
+
+    # Filter by similarity - OCR corrections must resemble original
+    cands = [
+        c for c in cands
+        if SequenceMatcher(None, word.lower(), c.lower()).ratio() > SIMILARITY_FLOOR
+    ]
+    if not cands:
+        return 0.0, None, []
+
+    # Score [original, *corrections]
+    all_cands = [word] + cands
+    scores, raw_lps = _score_candidates(text, ws, we, all_cands)
+
+    if len(raw_lps) < 2:
+        return 0.0, None, []
+
+    # Find best correction
+    orig_lp = raw_lps[0]
+    best_idx = 1
+    best_lp = raw_lps[1]
+    for i in range(2, len(raw_lps)):
+        if raw_lps[i] > best_lp:
+            best_lp = raw_lps[i]
+            best_idx = i
+
+    improvement = best_lp - orig_lp
+    best_cand = all_cands[best_idx] if improvement > 0 else None
+
+    # Build debug info
+    all_scored = list(zip(all_cands, raw_lps))
+
+    return improvement, best_cand, all_scored
+
+
+def _has_ocr_pattern(word: str) -> bool:
+    """Check if word contains any OCR confusion pattern worth exploring."""
+    w = word.lower()
+    # Check main confusion map keys
+    for key in CONFUSIONS:
+        if key.lower() in w:
+            return True
+    # Check positional confusion keys
+    for key in POSITIONAL_CONFUSIONS:
+        if key.lower() in w:
+            return True
+    return False
+
+
 # ── /v1/ocr/check ─────────────────────────────────────────────────────
 
-def _ocr_check(text: str) -> CheckResponse:
+def _ocr_check(text: str, debug: bool = False) -> CheckResponse:
+    debug_info = DebugInfo() if (debug or DEBUG_MODE) else None
     preds = _token_predictions(text)
     if not preds:
-        return CheckResponse(result="ok", score=0.95, spans=[])
+        return CheckResponse(result="ok", score=0.95, spans=[], debug=debug_info)
+
+    # Collect token debug info
+    if debug_info is not None:
+        for t in preds:
+            top_preds = [
+                (lm.tokenizer.decode([tid]).strip(), prob, tid)
+                for tid, prob in t["top_preds"]
+            ]
+            debug_info.all_tokens.append(TokenDebug(
+                text=t["actual_text"],
+                token_id=t["actual_id"],
+                char_start=t["char_start"],
+                char_end=t["char_end"],
+                actual_prob=t["actual_prob"],
+                actual_log_prob=t["actual_log_prob"],
+                top_predictions=top_preds,
+                is_suspicious=t["actual_prob"] < TOKEN_PROB_FLOOR,
+            ))
 
     # ── Phase 1: find words with suspicious tokens ──
-    # A word enters Phase 2 if EITHER:
+    # A word enters Phase 2 if ANY of:
     #   (a) it contains a token with P(actual | prefix) < floor  (LM signal), OR
-    #   (b) it matches a structural OCR-confusion pattern         (heuristic signal)
+    #   (b) it matches a structural OCR-confusion pattern         (heuristic signal), OR
+    #   (c) BRANCH_EXPLORE is enabled and word has an OCR pattern worth trying
     word_candidates: list[tuple[str, int, int, list[dict], list[dict], bool]] = []
 
     for m in re.finditer(r"\S+", text):
@@ -656,7 +903,15 @@ def _ocr_check(text: str) -> CheckResponse:
             if min_prob > 0.5:
                 structural = False
 
-        if not suspicious and not structural:
+        # Branch-and-explore: also include words with OCR patterns even if
+        # they passed surprisal/structural checks. Let scoring decide.
+        branch_explore = False
+        if BRANCH_EXPLORE and not suspicious and not structural:
+            if _has_ocr_pattern(word):
+                branch_explore = True
+                log.info("  branch-explore: trying corrections on '%s'", word)
+
+        if not suspicious and not structural and not branch_explore:
             continue
 
         # Log what we found
@@ -671,27 +926,55 @@ def _ocr_check(text: str) -> CheckResponse:
             )
         if structural and not suspicious:
             log.info("  structural match on '%s' (no LM signal)", word)
-        word_candidates.append((word, ws, we, word_tokens, suspicious, structural))
+        # Include branch_explore flag (treated as structural for filtering purposes)
+        is_structural = structural or branch_explore
+        structural_reasons = _get_structural_reasons(word) if structural else []
+        word_candidates.append((word, ws, we, word_tokens, suspicious, is_structural, branch_explore, structural_reasons))
 
     log.info(
         "OCR check: %d tokens, floor=%.3f, candidate words=%d (%s)",
         len(preds), TOKEN_PROB_FLOOR,
         len(word_candidates),
-        ", ".join(w for w, _, _, _, _, _ in word_candidates),
+        ", ".join(w for w, _, _, _, _, _, _, _ in word_candidates),
     )
 
     if not word_candidates:
         min_prob = min(t["actual_prob"] for t in preds)
         margin = min(min_prob / TOKEN_PROB_FLOOR, 1.0) if TOKEN_PROB_FLOOR > 0 else 1.0
         conf = 0.80 + 0.19 * min(margin, 1.0)
-        return CheckResponse(result="ok", score=round(conf, 3), spans=[])
+        return CheckResponse(result="ok", score=round(conf, 3), spans=[], debug=debug_info)
 
     # ── Phase 2: build corrections, score, and filter ──
     spans: list[Span] = []
-    for word, ws, we, word_tokens, suspicious, structural in word_candidates:
+    for word, ws, we, word_tokens, suspicious, structural, branch_explore_flag, structural_reasons in word_candidates:
+        # Initialize debug entry for this word
+        word_debug = None
+        if debug_info is not None:
+            # Collect tokenization info for this word
+            tokenization = [lm.tokenizer.decode([t["actual_id"]]) for t in word_tokens]
+            token_ids = [t["actual_id"] for t in word_tokens]
+            token_probs = [t["actual_prob"] for t in word_tokens]
+            token_log_probs = [t["actual_log_prob"] for t in word_tokens]
+            word_surprisal = -sum(token_log_probs) / len(token_log_probs) if token_log_probs else 0.0
+            suspicious_indices = [i for i, t in enumerate(word_tokens) if t["actual_prob"] < TOKEN_PROB_FLOOR]
+
+            word_debug = WordDebug(
+                word=word, start=ws, end=we,
+                tokenization=tokenization,
+                token_ids=token_ids,
+                token_probs=token_probs,
+                word_surprisal=word_surprisal,
+                suspicious_tokens=suspicious_indices,
+                structural_match=structural,
+                structural_reasons=structural_reasons,
+                branch_explore=branch_explore_flag,
+            )
+            debug_info.words_analyzed.append(word_debug)
+
         # Correction candidates from softmax top-k
         seen: set[str] = {word.lower()}
-        cands: list[str] = []
+        softmax_cands: list[str] = []
+        heuristic_cands: list[str] = []
 
         # Softmax-based corrections (only when we have suspicious tokens)
         if suspicious:
@@ -699,17 +982,28 @@ def _ocr_check(text: str) -> CheckResponse:
                 c = _build_correction(word, ws, we, word_tokens, suspicious, rank=rank)
                 cl = c.lower()
                 if c and cl not in seen and cl != word.lower():
-                    cands.append(c)
+                    softmax_cands.append(c)
                     seen.add(cl)
 
         # Heuristic corrections from the OCR confusion map.
         for c in _heuristic_candidates(word):
             cl = c.lower()
             if cl not in seen:
-                cands.append(c)
+                heuristic_cands.append(c)
                 seen.add(cl)
 
+        cands = softmax_cands + heuristic_cands
+
+        if word_debug is not None:
+            word_debug.softmax_candidates = list(softmax_cands)
+            word_debug.heuristic_candidates = list(heuristic_cands)
+            word_debug.candidates_generated = list(cands)
+            word_debug.candidates_pre_filter = list(cands)
+
         if not cands:
+            if word_debug is not None:
+                word_debug.outcome = "no_candidates"
+                word_debug.outcome_reason = "No correction candidates could be generated for this word"
             continue
 
         # Similarity filter: OCR corrections must resemble the original.
@@ -729,12 +1023,23 @@ def _ocr_check(text: str) -> CheckResponse:
         #     distance ≤ 2. This kills common-word paraphrases like
         #     "for"→"from", "washed"→"was", "community"→"city".
         if not structural:
+            # Allow small length shifts (±2) so OCR-specific transforms
+            # like d→cl (endose→enclose, disdose→disclose) survive when
+            # the LM flags the word but no structural pattern matched.
+            # Edit distance ≤ 2 still blocks wild paraphrases.
             cands = [
                 c for c in cands
-                if len(c) == len(word) and _edit_distance(word, c) <= 2
+                if abs(len(c) - len(word)) <= 2 and _edit_distance(word, c) <= 2
             ]
+
+        if word_debug is not None:
+            word_debug.candidates_after_filter = list(cands)
+
         if not cands:
             log.info("  %s → no similar corrections, skipping", word)
+            if word_debug is not None:
+                word_debug.outcome = "filtered_no_similar"
+                word_debug.outcome_reason = "All candidates filtered out by similarity/shape constraints"
             continue
 
         # Score [original, *corrections] by full-text log-prob
@@ -749,6 +1054,11 @@ def _ocr_check(text: str) -> CheckResponse:
             word, all_cands, scores, improvement,
         )
 
+        if word_debug is not None:
+            word_debug.scores = dict(zip(all_cands, scores))
+            word_debug.raw_log_probs = dict(zip(all_cands, raw_lps))
+            word_debug.improvement = improvement
+
         # False-positive filter:
         #   1. Original must lose (correction scores higher)
         #   2. The log-prob improvement must be substantial (MIN_LP_GAIN nats).
@@ -759,6 +1069,9 @@ def _ocr_check(text: str) -> CheckResponse:
         best_corr = max(scores[1:], default=0)
         if scores and scores[0] >= best_corr:
             log.info("  → false positive (original wins)")
+            if word_debug is not None:
+                word_debug.outcome = "fp_original_wins"
+                word_debug.outcome_reason = f"Original word scored {scores[0]:.3f} >= best correction {best_corr:.3f}"
             continue
         if not structural:
             # When the only signal is softmax probability and the surface form
@@ -773,6 +1086,9 @@ def _ocr_check(text: str) -> CheckResponse:
                     "  → false positive (improvement %.1f < %.1f)",
                     improvement, gain_threshold,
                 )
+                if word_debug is not None:
+                    word_debug.outcome = f"fp_low_gain ({improvement:.1f} < {gain_threshold:.1f})"
+                    word_debug.outcome_reason = f"Log-prob improvement {improvement:.1f} nats below threshold {gain_threshold:.1f}"
                 continue
 
         # Build suggestions sorted by score. Always preserve the top-2
@@ -793,22 +1109,26 @@ def _ocr_check(text: str) -> CheckResponse:
                 kind="probable_ocr_error",
                 suggestions=suggestions,
             ))
+            if word_debug is not None:
+                best_suggestion = suggestions[0]
+                word_debug.outcome = "flagged"
+                word_debug.outcome_reason = f"OCR error detected, best suggestion '{best_suggestion.text}' with score {best_suggestion.score:.3f}"
 
     if not spans:
-        return CheckResponse(result="ok", score=round(0.85, 3), spans=[])
+        return CheckResponse(result="ok", score=round(0.85, 3), spans=[], debug=debug_info)
 
     best_suggestion_score = max(
         s.score for span in spans for s in span.suggestions
     ) if spans else 0.5
     conf = 0.80 + 0.19 * min(best_suggestion_score, 1.0)
     return CheckResponse(
-        result="issue_detected", score=round(conf, 3), spans=spans,
+        result="issue_detected", score=round(conf, 3), spans=spans, debug=debug_info,
     )
 
 
 # ── /v1/text/check-continuation ───────────────────────────────────────
 
-def _continuation_check(first: str, second: str) -> ContinuationResponse:
+def _continuation_check(first: str, second: str, debug: bool = False) -> ContinuationResponse:
     """
     Combined score:
       pmi_score = sigmoid((PMI − 0.5) * 3)      — does first help predict second?
@@ -818,6 +1138,15 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
     The PMI bias (0.5) ensures weakly-positive PMI from unrelated but fluent
     text doesn't push score above 0.5.  Absolute score prevents gibberish.
     """
+    debug_info = ContinuationDebug() if (debug or DEBUG_MODE) else None
+
+    # Tokenize first and second separately for debug
+    if debug_info is not None:
+        first_enc = lm.tokenizer(first, add_special_tokens=False)
+        second_enc = lm.tokenizer(second, add_special_tokens=False)
+        debug_info.first_tokens = [lm.tokenizer.decode([tid]) for tid in first_enc["input_ids"]]
+        debug_info.second_tokens = [lm.tokenizer.decode([tid]) for tid in second_enc["input_ids"]]
+
     # Conditional: P(second | first)
     # Use offset_mapping to locate the boundary precisely. BPE tokenizers
     # merge the space into the first token of `second` (" dog"), so naively
@@ -834,6 +1163,9 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
     joint_ids = joint_enc["input_ids"].to(DEVICE)
     j_offsets = joint_enc["offset_mapping"][0]
 
+    if debug_info is not None:
+        debug_info.joint_tokens = [lm.tokenizer.decode([tid.item()]) for tid in joint_ids[0]]
+
     split = joint_ids.shape[1]
     for i in range(joint_ids.shape[1]):
         cs = int(j_offsets[i][0].item())
@@ -843,18 +1175,28 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
             split = i
             break
 
+    if debug_info is not None:
+        debug_info.boundary_token_idx = split
+
     with torch.no_grad():
         j_logits = lm.model(joint_ids).logits[0]
     j_lps = F.log_softmax(j_logits, dim=-1)
 
+    cond_probs: list[float] = []
     cond_sum, cond_n = 0.0, 0
     for i in range(split, joint_ids.shape[1]):
         if i > 0:
-            cond_sum += j_lps[i - 1, joint_ids[0, i].item()].item()
+            lp = j_lps[i - 1, joint_ids[0, i].item()].item()
+            cond_sum += lp
             cond_n   += 1
+            cond_probs.append(lp)
     if cond_n == 0:
-        return ContinuationResponse(result="unlikely_continuation", score=0.5)
+        return ContinuationResponse(result="unlikely_continuation", score=0.5, debug=debug_info)
     cond_avg = cond_sum / cond_n
+
+    if debug_info is not None:
+        debug_info.conditional_token_probs = cond_probs
+        debug_info.conditional_avg_log_prob = cond_avg
 
     # Unconditional: P(second)
     sec_enc = lm.tokenizer(second, return_tensors="pt", add_special_tokens=False)
@@ -863,11 +1205,18 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
         s_logits = lm.model(sec_ids).logits[0]
     s_lps = F.log_softmax(s_logits, dim=-1)
 
+    uncond_probs: list[float] = []
     uncond_sum, uncond_n = 0.0, 0
     for i in range(1, sec_ids.shape[1]):
-        uncond_sum += s_lps[i - 1, sec_ids[0, i].item()].item()
+        lp = s_lps[i - 1, sec_ids[0, i].item()].item()
+        uncond_sum += lp
         uncond_n   += 1
+        uncond_probs.append(lp)
     uncond_avg = uncond_sum / max(uncond_n, 1)
+
+    if debug_info is not None:
+        debug_info.unconditional_token_probs = uncond_probs
+        debug_info.unconditional_avg_log_prob = uncond_avg
 
     # PMI score: does context help?
     # Bias of 0.2: even weakly-positive PMI suggests genuine continuation,
@@ -894,7 +1243,15 @@ def _continuation_check(first: str, second: str) -> ContinuationResponse:
     )
 
     result = "likely_continuation" if score >= 0.5 else "unlikely_continuation"
-    return ContinuationResponse(result=result, score=round(score, 3))
+
+    if debug_info is not None:
+        debug_info.pmi = pmi
+        debug_info.pmi_score = pmi_score
+        debug_info.abs_score = abs_score
+        debug_info.final_score = score
+        debug_info.verdict = result
+
+    return ContinuationResponse(result=result, score=round(score, 3), debug=debug_info)
 
 
 # ── FastAPI ────────────────────────────────────────────────────────────
@@ -935,12 +1292,12 @@ async def health():
 @app.post("/v1/ocr/check", response_model=CheckResponse)
 async def ocr_check(req: CheckRequest):
     async with _gpu_sem:
-        return await asyncio.to_thread(_ocr_check, req.text)
+        return await asyncio.to_thread(_ocr_check, req.text, req.debug)
 
 @app.post("/v1/text/check-continuation", response_model=ContinuationResponse)
 async def check_continuation(req: ContinuationRequest):
     async with _gpu_sem:
-        return await asyncio.to_thread(_continuation_check, req.first, req.second)
+        return await asyncio.to_thread(_continuation_check, req.first, req.second, req.debug)
 
 
 if __name__ == "__main__":
