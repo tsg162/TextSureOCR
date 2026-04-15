@@ -18,6 +18,12 @@ TUNNEL_TOKEN="${TEXTSURE_TUNNEL_TOKEN:-}"
 AUTH_TOKEN="${TEXTSURE_AUTH_TOKEN:-}"
 PORT="${TEXTSURE_PORT:-5002}"
 
+# Vast.ai sets $CONTAINER_ID for every container; persist it so /health can expose it.
+VAST_INSTANCE_ID="${TEXTSURE_VAST_INSTANCE_ID:-${CONTAINER_ID:-}}"
+if [ -n "$VAST_INSTANCE_ID" ] && ! grep -q '^TEXTSURE_VAST_INSTANCE_ID=' "$ENV_FILE"; then
+  echo "TEXTSURE_VAST_INSTANCE_ID=$VAST_INSTANCE_ID" >> "$ENV_FILE"
+fi
+
 echo "=== TextSureOCR Install ==="
 echo ""
 
@@ -58,6 +64,7 @@ cd "$WORK"
 
 export TEXTSURE_PORT="$PORT"
 export TEXTSURE_AUTH_TOKEN="$AUTH_TOKEN"
+export TEXTSURE_VAST_INSTANCE_ID="$VAST_INSTANCE_ID"
 
 nohup python3 app.py > "$WORK/textsure.log" 2>&1 &
 SERVICE_PID=$!

@@ -37,6 +37,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ── Configuration ──────────────────────────────────────────────────────
 
 AUTH_TOKEN       = os.getenv("TEXTSURE_AUTH_TOKEN", "")
+VAST_INSTANCE_ID = os.getenv("TEXTSURE_VAST_INSTANCE_ID", "")
 MODEL_ID         = os.getenv("TEXTSURE_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE            = torch.float16 if DEVICE == "cuda" else torch.float32
@@ -685,12 +686,15 @@ async def auth_middleware(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    return {
+    body = {
         "status": "ok",
         "model": MODEL_ID,
         "device": DEVICE,
         "model_loaded": lm.model is not None,
     }
+    if VAST_INSTANCE_ID:
+        body["vast_instance_id"] = VAST_INSTANCE_ID
+    return body
 
 @app.post("/v1/ocr/check", response_model=CheckResponse)
 async def ocr_check(req: CheckRequest):
